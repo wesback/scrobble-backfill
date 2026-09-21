@@ -5,12 +5,14 @@
 package spotify
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 	"time"
 )
@@ -23,13 +25,27 @@ const (
 	CodePodcast          = "excluded_podcast"
 	CodeLocalOrOffline   = "excluded_local_or_offline"
 	CodeInputUnavailable = "input_unavailable"
+	CodeArchivePath      = "unsafe_archive_path"
+	CodeArchiveEntry     = "unreadable_archive_entry"
+
+	// DefaultMaxArchiveUncompressedBytes bounds the total declared
+	// uncompressed content in one archive when no explicit limit is supplied.
+	DefaultMaxArchiveUncompressedBytes uint64 = 512 << 20
 )
 
 // Input is one JSON export supplied to Ingest. Name is an input identity used
-// in diagnostics and should normally be the source file name.
+// in diagnostics and should normally be the source file name. Names ending
+// in .zip are treated as Spotify ZIP exports.
 type Input struct {
 	Name   string
 	Reader io.Reader
+}
+
+// IngestOptions controls resource limits for archive ingestion.
+type IngestOptions struct {
+	// MaxArchiveUncompressedBytes is the maximum cumulative uncompressed size
+	// of entries in one archive. Zero selects the default limit.
+	MaxArchiveUncompressedBytes uint64
 }
 
 // Play is the normalized representation consumed by later comparison and
@@ -73,17 +89,25 @@ type Consumer func(Play) error
 // diagnostics.
 type WarningHandler func(Warning)
 
+var errArchiveLimitExceeded = errors.New("archive uncompressed byte limit exceeded")
+
 // Ingest streams one or more Extended Streaming History JSON arrays to
 // consumer. A corrupt input produces one warning and processing continues with
 // later inputs. Consumer and context errors are returned because they
 // indicate that the caller, rather than the input, stopped the pipeline.
 func Ingest(ctx context.Context, inputs []Input, consumer Consumer, warningHandler WarningHandler) (Summary, error) {
+	return IngestWithOptions(ctx, inputs, consumer, warningHandler, IngestOptions{})
+}
+
+// IngestWithOptions streams raw JSON inputs and ZIP archives to consumer.
+func IngestWithOptions(ctx context.Context, inputs []Input, consumer Consumer, warningHandler WarningHandler, options IngestOptions) (Summary, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if consumer == nil {
 		return Summary{}, errors.New("spotify ingestion consumer is nil")
 	}
+	options = normalizeIngestOptions(options)
 
 	var summary Summary
 	summary.Inputs = len(inputs)
@@ -103,7 +127,13 @@ func Ingest(ctx context.Context, inputs []Input, consumer Consumer, warningHandl
 			})
 			continue
 		}
-		if err := ingestInput(ctx, input, consumer, warningHandler, &summary); err != nil {
+		var err error
+		if isZIPInput(input.Name) {
+			err = ingestArchive(ctx, input, consumer, warningHandler, &summary, options)
+		} else {
+			err = ingestInput(ctx, input, consumer, warningHandler, &summary)
+		}
+		if err != nil {
 			return summary, err
 		}
 	}
@@ -112,6 +142,12 @@ func Ingest(ctx context.Context, inputs []Input, consumer Consumer, warningHandl
 
 // IngestFiles opens and streams the named JSON export files in order.
 func IngestFiles(ctx context.Context, paths []string, consumer Consumer, warningHandler WarningHandler) (Summary, error) {
+	return IngestFilesWithOptions(ctx, paths, consumer, warningHandler, IngestOptions{})
+}
+
+// IngestFilesWithOptions opens and streams named JSON or ZIP export files in
+// order.
+func IngestFilesWithOptions(ctx context.Context, paths []string, consumer Consumer, warningHandler WarningHandler, options IngestOptions) (Summary, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -137,7 +173,7 @@ func IngestFiles(ctx context.Context, paths []string, consumer Consumer, warning
 			continue
 		}
 
-		fileSummary, ingestErr := Ingest(ctx, []Input{{Name: path, Reader: file}}, consumer, warningHandler)
+		fileSummary, ingestErr := IngestWithOptions(ctx, []Input{{Name: path, Reader: file}}, consumer, warningHandler, options)
 		closeErr := file.Close()
 		summary.Records += fileSummary.Records
 		summary.Emitted += fileSummary.Emitted
@@ -154,10 +190,188 @@ func IngestFiles(ctx context.Context, paths []string, consumer Consumer, warning
 	return summary, nil
 }
 
+func normalizeIngestOptions(options IngestOptions) IngestOptions {
+	if options.MaxArchiveUncompressedBytes == 0 {
+		options.MaxArchiveUncompressedBytes = DefaultMaxArchiveUncompressedBytes
+	}
+	return options
+}
+
+func isZIPInput(name string) bool {
+	return strings.EqualFold(path.Ext(strings.TrimSpace(name)), ".zip")
+}
+
+func ingestArchive(ctx context.Context, input Input, consumer Consumer, warningHandler WarningHandler, summary *Summary, options IngestOptions) error {
+	reader, cleanup, err := openArchiveReader(input.Reader)
+	if err != nil {
+		return fmt.Errorf("open Spotify archive %q: %w", input.Name, err)
+	}
+	defer cleanup()
+
+	declaredBytes := uint64(0)
+	for _, entry := range reader.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		unsafeName := unsafeArchiveName(entry.Name)
+		if unsafeName {
+			emitWarning(summary, warningHandler, Warning{
+				Input:    archiveEntryInput(input.Name, entry.Name),
+				Code:     CodeArchivePath,
+				Reason:   "archive entry name is absolute or contains parent-directory traversal",
+				Severity: "warning",
+			})
+		}
+		if entry.UncompressedSize64 > options.MaxArchiveUncompressedBytes-declaredBytes {
+			return fmt.Errorf(
+				"Spotify archive %q exceeds maximum cumulative uncompressed size of %d bytes",
+				input.Name, options.MaxArchiveUncompressedBytes,
+			)
+		}
+		previousDeclaredBytes := declaredBytes
+		declaredBytes += entry.UncompressedSize64
+		if unsafeName || entry.FileInfo().IsDir() || !strings.EqualFold(path.Ext(entry.Name), ".json") {
+			continue
+		}
+
+		entryReader, err := entry.Open()
+		if err != nil {
+			emitWarning(summary, warningHandler, Warning{
+				Input:    archiveEntryInput(input.Name, entry.Name),
+				Code:     CodeArchiveEntry,
+				Reason:   "archive entry could not be opened: " + err.Error(),
+				Severity: "warning",
+			})
+			continue
+		}
+		entryInput := Input{
+			Name: archiveEntryInput(input.Name, entry.Name),
+			Reader: &archiveLimitReader{
+				Reader:    entryReader,
+				Remaining: options.MaxArchiveUncompressedBytes - previousDeclaredBytes,
+			},
+		}
+		ingestErr := ingestInput(ctx, entryInput, consumer, warningHandler, summary)
+		closeErr := entryReader.Close()
+		if ingestErr != nil {
+			return ingestErr
+		}
+		if closeErr != nil {
+			emitWarning(summary, warningHandler, Warning{
+				Input:    entryInput.Name,
+				Code:     CodeArchiveEntry,
+				Reason:   "archive entry could not be read: " + closeErr.Error(),
+				Severity: "warning",
+			})
+		}
+	}
+	return nil
+}
+
+type archiveLimitReader struct {
+	io.Reader
+	Remaining uint64
+}
+
+func (reader *archiveLimitReader) Read(p []byte) (int, error) {
+	if reader.Remaining == 0 {
+		var probe [1]byte
+		n, err := reader.Reader.Read(probe[:])
+		if n > 0 {
+			return 0, errArchiveLimitExceeded
+		}
+		return 0, err
+	}
+	readLength := len(p)
+	if uint64(readLength) > reader.Remaining+1 {
+		readLength = int(reader.Remaining + 1)
+	}
+	n, err := reader.Reader.Read(p[:readLength])
+	if uint64(n) > reader.Remaining {
+		return int(reader.Remaining), errArchiveLimitExceeded
+	}
+	reader.Remaining -= uint64(n)
+	return n, err
+}
+
+func archiveEntryInput(archiveName, entryName string) string {
+	return archiveName + "::" + entryName
+}
+
+func unsafeArchiveName(name string) bool {
+	normalized := strings.ReplaceAll(name, `\`, "/")
+	if path.IsAbs(normalized) || strings.HasPrefix(normalized, "/") {
+		return true
+	}
+	if len(normalized) >= 2 && normalized[1] == ':' {
+		return true
+	}
+	for _, segment := range strings.Split(normalized, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func openArchiveReader(input io.Reader) (*zip.Reader, func(), error) {
+	if readerAt, ok := input.(io.ReaderAt); ok {
+		if seeker, ok := input.(io.Seeker); ok {
+			current, err := seeker.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return nil, func() {}, err
+			}
+			size, err := seeker.Seek(0, io.SeekEnd)
+			if err != nil {
+				return nil, func() {}, err
+			}
+			if _, err := seeker.Seek(current, io.SeekStart); err != nil {
+				return nil, func() {}, err
+			}
+			if current < 0 || size < current {
+				return nil, func() {}, errors.New("archive reader position is outside its bounds")
+			}
+			reader, err := zip.NewReader(io.NewSectionReader(readerAt, current, size-current), size-current)
+			return reader, func() {}, err
+		}
+	}
+
+	file, err := os.CreateTemp("", "rescrobble-spotify-archive-*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("stage archive: %w", err)
+	}
+	cleanup := func() {
+		_ = file.Close()
+		_ = os.Remove(file.Name())
+	}
+	if _, err := io.Copy(file, input); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("stage archive: %w", err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("rewind staged archive: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("stat staged archive: %w", err)
+	}
+	reader, err := zip.NewReader(file, info.Size())
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return reader, cleanup, nil
+}
+
 func ingestInput(ctx context.Context, input Input, consumer Consumer, warningHandler WarningHandler, summary *Summary) error {
 	decoder := json.NewDecoder(input.Reader)
 	token, err := decoder.Token()
 	if err != nil {
+		if errors.Is(err, errArchiveLimitExceeded) {
+			return err
+		}
 		emitWarning(summary, warningHandler, corruptWarning(input.Name, err))
 		return nil
 	}
@@ -180,6 +394,9 @@ func ingestInput(ctx context.Context, input Input, consumer Consumer, warningHan
 		recordNumber++
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
+			if errors.Is(err, errArchiveLimitExceeded) {
+				return err
+			}
 			emitWarning(summary, warningHandler, corruptWarningAt(input.Name, recordNumber, err))
 			return nil
 		}
@@ -189,6 +406,9 @@ func ingestInput(ctx context.Context, input Input, consumer Consumer, warningHan
 		}
 	}
 	if _, err := decoder.Token(); err != nil {
+		if errors.Is(err, errArchiveLimitExceeded) {
+			return err
+		}
 		emitWarning(summary, warningHandler, corruptWarning(input.Name, err))
 		return nil
 	}
