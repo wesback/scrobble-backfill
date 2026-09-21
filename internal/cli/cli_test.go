@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/wesback/scrobble-backfill/internal/config"
+	"github.com/wesback/scrobble-backfill/internal/observability"
 )
 
 func TestProfileUsePersistsActiveProfile(t *testing.T) {
@@ -109,5 +110,38 @@ func TestProfileOptionTakesPrecedenceOverPersistedActiveProfile(t *testing.T) {
 	}
 	if name != "work" {
 		t.Fatalf("resolved profile = %q, want explicit profile work", name)
+	}
+}
+
+func TestLogLevelOptionsExposeNormalVerboseAndDebug(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want observability.Level
+	}{
+		{name: "normal", args: []string{"--log-level", "normal", "profile", "use", "work"}, want: observability.LevelNormal},
+		{name: "verbose flag", args: []string{"--verbose", "profile", "use", "work"}, want: observability.LevelVerbose},
+		{name: "debug flag", args: []string{"--debug", "profile", "use", "work"}, want: observability.LevelDebug},
+		{name: "verbose value", args: []string{"--log-level=verbose", "profile", "use", "work"}, want: observability.LevelVerbose},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options, _, err := parseArgs(test.args)
+			if err != nil {
+				t.Fatalf("parse args: %v", err)
+			}
+			if !options.logLevelExplicit {
+				t.Fatal("log level was not marked explicit")
+			}
+			if options.logLevel != test.want {
+				t.Fatalf("log level = %v, want %v", options.logLevel, test.want)
+			}
+		})
+	}
+}
+
+func TestLogLevelOptionRejectsUnknownLevel(t *testing.T) {
+	if _, _, err := parseArgs([]string{"--log-level", "trace", "profile", "use", "work"}); err == nil {
+		t.Fatal("expected unknown log level to fail")
 	}
 }

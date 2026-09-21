@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/wesback/scrobble-backfill/internal/config"
+	"github.com/wesback/scrobble-backfill/internal/observability"
 )
 
 // Run executes the command line application using the default configuration
@@ -40,6 +41,21 @@ func RunWithStore(args []string, stdout, stderr io.Writer, store config.Store) i
 		printUsage(stderr)
 		return 2
 	}
+	if options.logLevelExplicit {
+		logger := observability.NewLogger(stderr, options.logLevel)
+		if err := logger.Normal("command.started", map[string]any{"command": command[0]}); err != nil {
+			fmt.Fprintf(stderr, "error: write normal log event: %v\n", err)
+			return 1
+		}
+		if err := logger.Verbose("command.options", map[string]any{"command": command[0], "argument_count": len(command) - 1}); err != nil {
+			fmt.Fprintf(stderr, "error: write verbose log event: %v\n", err)
+			return 1
+		}
+		if err := logger.Debug("command.debug", map[string]any{"command": command[0]}); err != nil {
+			fmt.Fprintf(stderr, "error: write debug log event: %v\n", err)
+			return 1
+		}
+	}
 
 	switch command[0] {
 	case "profile":
@@ -52,8 +68,10 @@ func RunWithStore(args []string, stdout, stderr io.Writer, store config.Store) i
 }
 
 type options struct {
-	profile string
-	help    bool
+	profile          string
+	logLevel         observability.Level
+	logLevelExplicit bool
+	help             bool
 }
 
 func parseArgs(args []string) (options, []string, error) {
@@ -68,6 +86,30 @@ func parseArgs(args []string) (options, []string, error) {
 			return options, command, nil
 		case arg == "--help", arg == "-h":
 			options.help = true
+		case arg == "--verbose":
+			options.logLevel = observability.LevelVerbose
+			options.logLevelExplicit = true
+		case arg == "--debug":
+			options.logLevel = observability.LevelDebug
+			options.logLevelExplicit = true
+		case arg == "--log-level":
+			if i+1 >= len(args) {
+				return options, nil, errors.New("--log-level requires normal, verbose, or debug")
+			}
+			level, err := observability.ParseLevel(args[i+1])
+			if err != nil {
+				return options, nil, err
+			}
+			options.logLevel = level
+			options.logLevelExplicit = true
+			i++
+		case strings.HasPrefix(arg, "--log-level="):
+			level, err := observability.ParseLevel(strings.TrimPrefix(arg, "--log-level="))
+			if err != nil {
+				return options, nil, err
+			}
+			options.logLevel = level
+			options.logLevelExplicit = true
 		case arg == "--profile":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
 				return options, nil, errors.New("--profile requires a non-empty name")
@@ -151,5 +193,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Global options:")
 	fmt.Fprintln(w, "  --profile <name>  select a configured profile for the command")
+	fmt.Fprintln(w, "  --log-level <level>  set logging to normal, verbose, or debug")
+	fmt.Fprintln(w, "  --verbose         enable verbose logging")
+	fmt.Fprintln(w, "  --debug           enable debug logging")
 	fmt.Fprintln(w, "  --help            show this help")
 }
