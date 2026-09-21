@@ -1,9 +1,11 @@
 package spotify
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,6 +174,138 @@ func TestIngestFilesContinuesAfterCorruptFile(t *testing.T) {
 	if len(warnings) != 1 || warnings[0].Code != CodeCorruptJSON || warnings[0].Input != corruptPath {
 		t.Fatalf("warnings = %#v, want one corrupt warning for %q", warnings, corruptPath)
 	}
+}
+
+func TestIngestStreamsMultipleZIPInputsAndContinuesAfterCorruptEntry(t *testing.T) {
+	first := zipData(t, []zipEntry{
+		{Name: "StreamingHistory_music_0.json", Data: "[" + recordJSON("First", "Artist", "Album", "spotify:track:first") + "]"},
+		{Name: "corrupt.json", Data: `[{"ts":`},
+	})
+	second := zipData(t, []zipEntry{
+		{Name: "StreamingHistory_music_1.json", Data: "[" + recordJSON("Second", "Artist", "Album", "spotify:track:second") + "]"},
+	})
+
+	var plays []Play
+	var warnings []Warning
+	summary, err := Ingest(context.Background(), []Input{
+		{Name: "spotify-first.zip", Reader: bytes.NewReader(first)},
+		{Name: "spotify-second.zip", Reader: bytes.NewReader(second)},
+		{Name: "separate.json", Reader: strings.NewReader("[" + recordJSON("Raw", "Artist", "Album", "spotify:track:raw") + "]")},
+	}, func(play Play) error {
+		plays = append(plays, play)
+		return nil
+	}, func(warning Warning) {
+		warnings = append(warnings, warning)
+	})
+	if err != nil {
+		t.Fatalf("ingest ZIP inputs: %v", err)
+	}
+	if summary.Inputs != 3 || summary.Emitted != 3 || len(plays) != 3 {
+		t.Fatalf("summary = %#v, plays = %#v; want three emitted plays", summary, plays)
+	}
+	if len(warnings) != 1 || warnings[0].Code != CodeCorruptJSON ||
+		!strings.Contains(warnings[0].Input, "spotify-first.zip::corrupt.json") {
+		t.Fatalf("warnings = %#v, want one corrupt ZIP-entry warning", warnings)
+	}
+}
+
+func TestIngestRejectsUnsafeZIPEntryNamesWithoutOpeningThem(t *testing.T) {
+	archive := zipData(t, []zipEntry{
+		{Name: "safe/history.json", Data: "[" + recordJSON("Safe", "Artist", "Album", "spotify:track:safe") + "]"},
+		{Name: "../escape.json", Data: "[" + recordJSON("Escape", "Artist", "Album", "spotify:track:escape") + "]"},
+		{Name: "/absolute.json", Data: "[" + recordJSON("Absolute", "Artist", "Album", "spotify:track:absolute") + "]"},
+		{Name: `nested\..\windows.json`, Data: "[" + recordJSON("Windows", "Artist", "Album", "spotify:track:windows") + "]"},
+	})
+
+	var plays []Play
+	var warnings []Warning
+	summary, err := Ingest(context.Background(), []Input{{Name: "unsafe.zip", Reader: bytes.NewReader(archive)}}, func(play Play) error {
+		plays = append(plays, play)
+		return nil
+	}, func(warning Warning) {
+		warnings = append(warnings, warning)
+	})
+	if err != nil {
+		t.Fatalf("ingest unsafe ZIP: %v", err)
+	}
+	if len(plays) != 1 || plays[0].TrackName != "Safe" || summary.Emitted != 1 {
+		t.Fatalf("plays = %#v, summary = %#v; want only safe entry", plays, summary)
+	}
+	if len(warnings) != 3 {
+		t.Fatalf("warnings = %#v; want three unsafe-path warnings", warnings)
+	}
+	for _, warning := range warnings {
+		if warning.Code != CodeArchivePath || warning.Severity != "warning" {
+			t.Fatalf("warning = %#v; want structured unsafe-path warning", warning)
+		}
+	}
+}
+
+func TestIngestZIPEnforcesConfiguredCumulativeUncompressedLimit(t *testing.T) {
+	entryJSON := "[" + strings.Repeat(" ", 600) + "]"
+	archive := zipData(t, []zipEntry{
+		{Name: "history-0.json", Data: entryJSON},
+		{Name: "history-1.json", Data: entryJSON},
+	})
+
+	var plays []Play
+	_, err := IngestWithOptions(context.Background(), []Input{{Name: "too-large.zip", Reader: bytes.NewReader(archive)}}, func(play Play) error {
+		plays = append(plays, play)
+		return nil
+	}, nil, IngestOptions{MaxArchiveUncompressedBytes: 1024})
+	if err == nil || !strings.Contains(err.Error(), "maximum cumulative uncompressed size of 1024 bytes") {
+		t.Fatalf("error = %v; want clear archive size-limit error", err)
+	}
+	if len(plays) != 0 {
+		t.Fatalf("plays = %#v; want no content emitted after limit rejection", plays)
+	}
+}
+
+func TestIngestZIPFromNonzeroReaderOffset(t *testing.T) {
+	archive := zipData(t, []zipEntry{
+		{Name: "history.json", Data: "[" + recordJSON("Offset", "Artist", "Album", "spotify:track:offset") + "]"},
+	})
+	input := append([]byte("archive prefix"), archive...)
+	reader := bytes.NewReader(input)
+	if _, err := reader.Seek(int64(len("archive prefix")), io.SeekStart); err != nil {
+		t.Fatalf("seek to archive: %v", err)
+	}
+
+	var plays []Play
+	summary, err := Ingest(context.Background(), []Input{{Name: "offset.zip", Reader: reader}}, func(play Play) error {
+		plays = append(plays, play)
+		return nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("ingest offset ZIP: %v", err)
+	}
+	if summary.Emitted != 1 || len(plays) != 1 || plays[0].TrackName != "Offset" {
+		t.Fatalf("summary = %#v, plays = %#v; want one offset archive play", summary, plays)
+	}
+}
+
+type zipEntry struct {
+	Name string
+	Data string
+}
+
+func zipData(t *testing.T, entries []zipEntry) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	for _, entry := range entries {
+		file, err := writer.Create(entry.Name)
+		if err != nil {
+			t.Fatalf("create ZIP entry %q: %v", entry.Name, err)
+		}
+		if _, err := file.Write([]byte(entry.Data)); err != nil {
+			t.Fatalf("write ZIP entry %q: %v", entry.Name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close ZIP: %v", err)
+	}
+	return output.Bytes()
 }
 
 func recordJSON(track, artist, album, uri string) string {
