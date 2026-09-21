@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows amd64
+            goos: windows
+            goarch: amd64
+            binary: rescrobble-windows-amd64.exe
+          - name: macOS amd64
+            goos: darwin
+            goarch: amd64
+            binary: rescrobble-darwin-amd64
+          - name: Linux amd64
+            goos: linux
+            goarch: amd64
+            binary: rescrobble-linux-amd64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build Rescrobble
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          go build -trimpath \
+            -ldflags "-X main.version=${VERSION}" \
+            -o "${{ matrix.binary }}" \
+            ./cmd/rescrobble
+
+      - name: Upload Rescrobble build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Rescrobble build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rescrobble-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload Rescrobble binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-assets/*
