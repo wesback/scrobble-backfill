@@ -122,6 +122,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		return runAnalyse(command[1:], options, stdout, stderr, dependencies)
 	case "import":
 		return runImport(command[1:], options, stdout, stderr, dependencies)
+	case "verify":
+		return runVerify(command[1:], options, stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", command[0])
 		printUsage(stderr)
@@ -746,6 +748,148 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	return 0
 }
 
+func runVerify(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if dependencies.ConfigStore == nil {
+		fmt.Fprintln(stderr, "error: configuration store is unavailable")
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	if dependencies.LastFMClient == nil {
+		fmt.Fprintln(stderr, "error: Last.fm client is unavailable")
+		return 1
+	}
+
+	cfg, err := dependencies.ConfigStore.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: load configuration: %v\n", err)
+		return 1
+	}
+	profileName, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	profile := cfg.Profiles[profileName]
+	if strings.TrimSpace(profile.LastFMUsername) == "" {
+		fmt.Fprintf(stderr, "error: profile %q has no Last.fm username; log in again\n", profileName)
+		return 1
+	}
+	sessionKey, err := dependencies.CredentialStore.Load(profileName)
+	if errors.Is(err, credentials.ErrCredentialNotFound) {
+		fmt.Fprintf(stderr, "error: profile %q is not logged in\n", profileName)
+		return 1
+	}
+	if err != nil {
+		printCredentialError(stderr, fmt.Sprintf("load %q credential", profileName), err)
+		return 1
+	}
+	if strings.TrimSpace(sessionKey) == "" {
+		fmt.Fprintf(stderr, "error: stored %q credential is empty\n", profileName)
+		return 1
+	}
+
+	store := dependencies.JournalStore
+	if store == nil {
+		store, err = journal.NewDefaultStore()
+		if err != nil {
+			fmt.Fprintf(stderr, "error: create verification journal: %v\n", err)
+			return 1
+		}
+	}
+	runs, err := store.ListRuns(profileName)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: read verification journal: %v\n", err)
+		return 1
+	}
+	selected := make(map[string]struct{}, len(command))
+	for _, invocationID := range command {
+		if strings.TrimSpace(invocationID) == "" {
+			fmt.Fprintln(stderr, "error: verify run identity must not be empty")
+			return 2
+		}
+		if _, duplicate := selected[invocationID]; duplicate {
+			fmt.Fprintf(stderr, "error: verify run %q was selected more than once\n", invocationID)
+			return 2
+		}
+		selected[invocationID] = struct{}{}
+	}
+
+	authenticated := lastfm.AuthenticatedProfile{
+		Username:   profile.LastFMUsername,
+		SessionKey: sessionKey,
+	}
+	verifiedRuns := 0
+	totalSubmitted := 0
+	totalConfirmed := 0
+	totalMissing := 0
+	for _, run := range runs {
+		if len(selected) > 0 {
+			if _, ok := selected[run.InvocationID]; !ok {
+				continue
+			}
+		}
+		verifiedRuns++
+		submissions := submittedPayloads(run)
+		fmt.Fprintf(stdout, "Verification for run %q\n", run.InvocationID)
+		if len(submissions) == 0 {
+			fmt.Fprintln(stdout, "  No submitted journaled scrobbles.")
+			continue
+		}
+		summary, results, verifyErr := lastfm.VerifySubmissions(
+			context.Background(),
+			dependencies.LastFMClient,
+			authenticated,
+			submissions,
+		)
+		if verifyErr != nil {
+			fmt.Fprintf(stderr, "error: verify run %q: %v\n", run.InvocationID, verifyErr)
+			return 1
+		}
+		fmt.Fprintf(stdout, "  Submitted journaled scrobbles: %d\n", summary.Submitted)
+		fmt.Fprintf(stdout, "  Confirmed journaled scrobbles: %d\n", summary.Confirmed)
+		fmt.Fprintf(stdout, "  Absent journaled scrobbles: %d\n", summary.Missing)
+		for _, result := range results {
+			if result.Status != lastfm.ComparisonStatusMissing {
+				continue
+			}
+			fmt.Fprintf(stdout, "  Absent: %q - %q at %s\n",
+				result.Submission.Artist,
+				result.Submission.Track,
+				result.Submission.Timestamp.UTC().Format(time.RFC3339),
+			)
+		}
+		totalSubmitted += summary.Submitted
+		totalConfirmed += summary.Confirmed
+		totalMissing += summary.Missing
+	}
+	if len(selected) > 0 && verifiedRuns == 0 {
+		fmt.Fprintf(stderr, "error: no journal run found for selected invocation(s): %s\n", strings.Join(command, ", "))
+		return 1
+	}
+	if verifiedRuns == 0 {
+		fmt.Fprintf(stdout, "No journal runs with submitted scrobbles found for profile %q.\n", profileName)
+		return 0
+	}
+	if verifiedRuns > 1 {
+		fmt.Fprintf(stdout, "Verification total: submitted=%d confirmed=%d absent=%d\n", totalSubmitted, totalConfirmed, totalMissing)
+	}
+	return 0
+}
+
+func submittedPayloads(run journal.Run) []journal.Submission {
+	var submissions []journal.Submission
+	for _, batch := range run.Batches {
+		if batch.State != journal.StateSubmitted {
+			continue
+		}
+		submissions = append(submissions, batch.Payloads...)
+	}
+	return submissions
+}
+
 func parseAnalysisDate(value string, location *time.Location) (time.Time, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -812,6 +956,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--yes] <export>...")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
 	fmt.Fprintf(w, "  import confirms interactively when more than %d missing plays would be submitted; --yes bypasses confirmation.\n", LargeImportConfirmationThreshold)
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)

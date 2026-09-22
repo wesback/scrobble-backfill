@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -471,6 +472,204 @@ func TestImportDryRunPlansBatchesWithoutSubmissionOrMarkingSubmitted(t *testing.
 	}
 }
 
+func TestVerifyReportsConfirmedAndMissingJournalEntriesReadOnly(t *testing.T) {
+	base := time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name             string
+		history          string
+		wantConfirmed    string
+		wantAbsent       string
+		wantAbsentDetail string
+	}{
+		{
+			name:          "fully confirmed",
+			history:       fmt.Sprintf(`{"recenttracks":{"track":[{"artist":{"#text":"Artist One"},"name":"Track One","date":{"uts":"%d"}},{"artist":{"#text":"Artist Two"},"name":"Track Two","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix(), base.Add(time.Minute).Unix()),
+			wantConfirmed: "Confirmed journaled scrobbles: 2",
+			wantAbsent:    "Absent journaled scrobbles: 0",
+		},
+		{
+			name:             "partially missing",
+			history:          fmt.Sprintf(`{"recenttracks":{"track":[{"artist":{"#text":"Artist One"},"name":"Track One","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix()),
+			wantConfirmed:    "Confirmed journaled scrobbles: 1",
+			wantAbsent:       "Absent journaled scrobbles: 1",
+			wantAbsentDetail: `"Artist Two" - "Track Two"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := config.NewFileStore(filepath.Join(root, "config.json"))
+			if err := store.Save(config.Config{
+				Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+				ActiveProfile: "personal",
+			}); err != nil {
+				t.Fatalf("seed config: %v", err)
+			}
+			journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+			run, err := journalStore.CreateRun("personal", "import-verify")
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			payloads := []journal.Submission{
+				{Artist: "Artist One", Track: "Track One", Timestamp: base},
+				{Artist: "Artist Two", Track: "Track Two", Timestamp: base.Add(time.Minute)},
+			}
+			if _, err := journalStore.PlanBatch("personal", run.InvocationID, payloads); err != nil {
+				t.Fatalf("plan batch: %v", err)
+			}
+			if err := journalStore.MarkSubmitted("personal", run.InvocationID, 1); err != nil {
+				t.Fatalf("mark submitted: %v", err)
+			}
+			before, err := journalStore.OpenRun("personal", run.InvocationID)
+			if err != nil {
+				t.Fatalf("read journal before verify: %v", err)
+			}
+
+			var methods []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Errorf("parse form: %v", err)
+					return
+				}
+				methods = append(methods, r.PostForm.Get("method"))
+				if r.PostForm.Get("method") != "user.getRecentTracks" {
+					t.Errorf("method = %q, want history only", r.PostForm.Get("method"))
+				}
+				if got := r.PostForm.Get("from"); got != fmt.Sprint(base.Unix()) {
+					t.Errorf("history from = %q, want %d", got, base.Unix())
+				}
+				if got := r.PostForm.Get("to"); got != fmt.Sprint(base.Add(time.Minute).Unix()) {
+					t.Errorf("history to = %q, want %d", got, base.Add(time.Minute).Unix())
+				}
+				fmt.Fprint(w, test.history)
+			}))
+			defer server.Close()
+
+			client := lastfm.NewClient("app-key", "app-secret")
+			client.BaseURL = server.URL
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDependencies(
+				[]string{"verify", run.InvocationID},
+				&stdout,
+				&stderr,
+				Dependencies{
+					ConfigStore:     store,
+					CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session-secret"}},
+					LastFMClient:    client,
+					JournalStore:    journalStore,
+				},
+			)
+			if exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+			}
+			output := stdout.String()
+			for _, want := range []string{test.wantConfirmed, test.wantAbsent} {
+				if !strings.Contains(output, want) {
+					t.Fatalf("stdout = %q, want %q", output, want)
+				}
+			}
+			if test.wantAbsentDetail != "" && !strings.Contains(output, test.wantAbsentDetail) {
+				t.Fatalf("stdout = %q, want absent journal detail %q", output, test.wantAbsentDetail)
+			}
+			if !reflect.DeepEqual(methods, []string{"user.getRecentTracks"}) {
+				t.Fatalf("Last.fm methods = %#v, want one history request", methods)
+			}
+			after, err := journalStore.OpenRun("personal", run.InvocationID)
+			if err != nil {
+				t.Fatalf("read journal after verify: %v", err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("verify changed journal: before %#v, after %#v", before, after)
+			}
+		})
+	}
+}
+
+func TestVerifyReportsHistoryAndMalformedResponseFailuresWithoutCredential(t *testing.T) {
+	const sessionKey = "verify-session-secret"
+	tests := []struct {
+		name     string
+		handler  func(http.ResponseWriter)
+		wantText string
+	}{
+		{
+			name: "history failure",
+			handler: func(w http.ResponseWriter) {
+				http.Error(w, "history unavailable", http.StatusBadGateway)
+			},
+			wantText: "Last.fm history request",
+		},
+		{
+			name: "malformed response",
+			handler: func(w http.ResponseWriter) {
+				fmt.Fprint(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Track","date":{"uts":"not-a-timestamp"}}],"@attr":{"totalPages":"1"}}}`)
+			},
+			wantText: "malformed response",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := config.NewFileStore(filepath.Join(root, "config.json"))
+			if err := store.Save(config.Config{
+				Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+				ActiveProfile: "personal",
+			}); err != nil {
+				t.Fatalf("seed config: %v", err)
+			}
+			journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+			run, err := journalStore.CreateRun("personal", "import-failure")
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			if _, err := journalStore.PlanBatch("personal", run.InvocationID, []journal.Submission{{
+				Artist: "Artist", Track: "Track", Timestamp: time.Unix(100, 0).UTC(),
+			}}); err != nil {
+				t.Fatalf("plan batch: %v", err)
+			}
+			if err := journalStore.MarkSubmitted("personal", run.InvocationID, 1); err != nil {
+				t.Fatalf("mark submitted: %v", err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Errorf("parse form: %v", err)
+					return
+				}
+				if method := r.PostForm.Get("method"); method != "user.getRecentTracks" {
+					t.Errorf("method = %q, want history only", method)
+				}
+				test.handler(w)
+			}))
+			defer server.Close()
+			client := lastfm.NewClient("app-key", "app-secret")
+			client.BaseURL = server.URL
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDependencies(
+				[]string{"verify", run.InvocationID},
+				&stdout,
+				&stderr,
+				Dependencies{
+					ConfigStore:     store,
+					CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": sessionKey}},
+					LastFMClient:    client,
+					JournalStore:    journalStore,
+				},
+			)
+			if exitCode == 0 {
+				t.Fatal("verify unexpectedly succeeded")
+			}
+			if !strings.Contains(stderr.String(), test.wantText) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), test.wantText)
+			}
+			if strings.Contains(stderr.String(), sessionKey) {
+				t.Fatalf("stderr exposes session credential: %q", stderr.String())
+			}
+			if strings.Contains(stdout.String(), sessionKey) {
+				t.Fatalf("stdout exposes session credential: %q", stdout.String())
+			}
+		})
+	}
+}
 func TestImportConfirmationThresholdAndYesOverride(t *testing.T) {
 	tests := []struct {
 		name       string
