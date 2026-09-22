@@ -19,6 +19,7 @@ import (
 	"github.com/wesback/scrobble-backfill/internal/journal"
 	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
+	"github.com/wesback/scrobble-backfill/internal/report"
 	"github.com/wesback/scrobble-backfill/internal/spotify"
 )
 
@@ -82,14 +83,25 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		printUsage(stderr)
 		return 2
 	}
-	if command[0] != "analyse" && command[0] != "import" &&
-		(options.from != "" || options.to != "" || options.timestampToleranceSet) {
-		fmt.Fprintln(stderr, "error: --from, --to, and --timestamp-tolerance are only valid with analyse or import")
+	if command[0] == "report" {
+		if options.reportFormatCount != 1 {
+			fmt.Fprintln(stderr, "error: report requires exactly one of --json, --csv, or --html")
+			printUsage(stderr)
+			return 2
+		}
+	} else if options.reportFormatCount != 0 {
+		fmt.Fprintln(stderr, "error: --json, --csv, and --html are only valid with report")
 		printUsage(stderr)
 		return 2
 	}
-	if command[0] != "import" && options.batchDelaySet {
-		fmt.Fprintln(stderr, "error: --batch-delay is only valid with import")
+	if command[0] != "analyse" && command[0] != "import" && command[0] != "report" &&
+		(options.from != "" || options.to != "" || options.timestampToleranceSet) {
+		fmt.Fprintln(stderr, "error: --from, --to, and --timestamp-tolerance are only valid with analyse, import, or report")
+		printUsage(stderr)
+		return 2
+	}
+	if command[0] != "import" && command[0] != "report" && options.batchDelaySet {
+		fmt.Fprintln(stderr, "error: --batch-delay is only valid with import or report")
 		printUsage(stderr)
 		return 2
 	}
@@ -129,6 +141,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		return runImport(command[1:], options, stdout, stderr, dependencies)
 	case "verify":
 		return runVerify(command[1:], options, stdout, stderr, dependencies)
+	case "report":
+		return runReport(command[1:], options, stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", command[0])
 		printUsage(stderr)
@@ -147,6 +161,8 @@ type options struct {
 	timestampToleranceSet bool
 	batchDelay            time.Duration
 	batchDelaySet         bool
+	reportFormat          report.Format
+	reportFormatCount     int
 	dryRun                bool
 	yes                   bool
 }
@@ -202,6 +218,15 @@ func parseArgs(args []string) (options, []string, error) {
 			options.dryRun = true
 		case arg == "--yes":
 			options.yes = true
+		case arg == "--json":
+			options.reportFormat = report.FormatJSON
+			options.reportFormatCount++
+		case arg == "--csv":
+			options.reportFormat = report.FormatCSV
+			options.reportFormatCount++
+		case arg == "--html":
+			options.reportFormat = report.FormatHTML
+			options.reportFormatCount++
 		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance", arg == "--batch-delay":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", arg)
@@ -683,70 +708,6 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	}
 	timestampTolerance, timestampToleranceSet := resolveTimestampTolerance(cfg, options)
 
-	var ingestionSummary spotify.Summary
-	missing := make([]spotify.Play, 0)
-	summary, err := lastfm.Compare(
-		context.Background(),
-		dependencies.LastFMClient,
-		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
-		lastfm.ComparisonRequest{
-			From:                  from,
-			To:                    to,
-			Timezone:              location,
-			TimestampTolerance:    timestampTolerance,
-			TimestampToleranceSet: timestampToleranceSet,
-			Plays: func(ctx context.Context, consume spotify.Consumer) error {
-				var ingestErr error
-				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
-					fmt.Fprintf(stderr, "warning: %s: %s\n", warning.Code, warning.Reason)
-				})
-				return ingestErr
-			},
-		},
-		func(result lastfm.ComparisonResult) error {
-			if result.Status == lastfm.ComparisonStatusMissing {
-				missing = append(missing, result.Play)
-			}
-			return nil
-		},
-	)
-	if err != nil {
-		fmt.Fprintf(stderr, "error: import comparison: %v\n", err)
-		return 1
-	}
-
-	fmt.Fprintf(stdout, "Import summary for profile %q\n", profileName)
-	fmt.Fprintf(stdout, "Total Spotify plays: %d\n", ingestionSummary.Records)
-	fmt.Fprintf(stdout, "Skipped duplicates: %d\n", summary.Matched)
-	fmt.Fprintf(stdout, "Missing plays: %d\n", summary.Missing)
-	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", from.In(location).Format("2006-01-02"), to.In(location).Format("2006-01-02"))
-	fmt.Fprintf(stdout, "Timestamp tolerance: %s\n", summary.TimestampTolerance)
-	if options.dryRun {
-		fmt.Fprintln(stdout, "Dry run: no Last.fm submissions will be sent.")
-	}
-
-	if len(missing) == 0 {
-		fmt.Fprintln(stdout, "Nothing to submit.")
-		return 0
-	}
-	if len(missing) > LargeImportConfirmationThreshold && !options.dryRun && !options.yes {
-		fmt.Fprintf(stdout, "Importing more than %d missing plays requires confirmation. Continue? [y/N] ", LargeImportConfirmationThreshold)
-		input := dependencies.Input
-		if input == nil {
-			input = os.Stdin
-		}
-		answer, readErr := bufio.NewReader(input).ReadString('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			fmt.Fprintf(stderr, "error: read import confirmation: %v\n", readErr)
-			return 1
-		}
-		answer = strings.TrimSpace(strings.ToLower(answer))
-		if answer != "y" && answer != "yes" {
-			fmt.Fprintln(stdout, "Import cancelled.")
-			return 1
-		}
-	}
-
 	store := dependencies.JournalStore
 	if store == nil {
 		store, err = journal.NewDefaultStore()
@@ -761,30 +722,386 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		fmt.Fprintf(stderr, "error: create import journal run: %v\n", err)
 		return 1
 	}
-	submissionOptions := dependencies.Submission
-	if options.batchDelaySet {
-		submissionOptions.BaselineDelay = options.batchDelay
-		submissionOptions.BaselineDelaySet = true
-	} else if cfg.BatchDelay != 0 {
-		submissionOptions.BaselineDelay = cfg.BatchDelay
-		submissionOptions.BaselineDelaySet = true
+	submissionDelay := resolveSubmissionDelay(cfg, options, dependencies.Submission)
+	settings := journal.RunSettings{
+		From: from, To: to,
+		TimestampTolerance: timestampTolerance, TimestampToleranceSet: true,
+		EligibilityRule: "eligible when the play satisfies Last.fm's scrobble eligibility rule",
+		BatchDelay:      submissionDelay, BatchDelaySet: true,
 	}
+	if metadataStore, ok := store.(journal.MetadataStore); ok {
+		if err := metadataStore.SetRunSettings(profileName, invocationID, settings); err != nil {
+			fmt.Fprintf(stderr, "error: record import settings: %v\n", err)
+			return 1
+		}
+	} else {
+		fmt.Fprintln(stderr, "error: journal store does not support portable run settings")
+		return 1
+	}
+	events := []journal.Event{{
+		Type: "run.started", Timestamp: time.Now().UTC(),
+		Data: map[string]string{"profile": profileName},
+	}}
+	failureBatch := ""
+	recordEvents := func() error {
+		if len(events) == 0 {
+			return nil
+		}
+		if recorder, ok := store.(journal.EventBatchRecorder); ok {
+			err := recorder.RecordEvents(profileName, invocationID, events)
+			if err == nil {
+				events = nil
+			}
+			return err
+		}
+		recorder, ok := store.(journal.EventRecorder)
+		if !ok {
+			return errors.New("journal store does not support portable run events")
+		}
+		for _, event := range events {
+			if err := recorder.RecordEvent(profileName, invocationID, event); err != nil {
+				return err
+			}
+		}
+		events = nil
+		return nil
+	}
+	failImport := func(importErr error) int {
+		data := map[string]string{
+			"failure_id": invocationID + ":run",
+			"message":    redactImportError(importErr.Error(), sessionKey),
+		}
+		if failureBatch != "" {
+			data["related_batch"] = failureBatch
+		}
+		events = append(events, journal.Event{
+			Type: "run.failed", Timestamp: time.Now().UTC(),
+			Data: data,
+		})
+		if recordErr := recordEvents(); recordErr != nil {
+			fmt.Fprintf(stderr, "error: record import outcome: %v (original error: %v)\n", recordErr, importErr)
+			return 1
+		}
+		fmt.Fprintf(stderr, "error: %v\n", importErr)
+		return 1
+	}
+
+	var ingestionSummary spotify.Summary
+	missing := make([]spotify.Play, 0)
+	matchedCount := 0
+	eligibleCount := 0
+	summary, err := lastfm.Compare(
+		context.Background(),
+		dependencies.LastFMClient,
+		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
+		lastfm.ComparisonRequest{
+			From:                  from,
+			To:                    to,
+			Timezone:              location,
+			TimestampTolerance:    timestampTolerance,
+			TimestampToleranceSet: timestampToleranceSet,
+			Plays: func(ctx context.Context, consume spotify.Consumer) error {
+				var ingestErr error
+				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
+					fmt.Fprintf(stderr, "warning: %s: %s\n", warning.Code, warning.Reason)
+					events = append(events, journal.Event{
+						Type: "ingestion.warning", Timestamp: time.Now().UTC(),
+						Data: warningEventData(warning),
+					})
+				})
+				return ingestErr
+			},
+		},
+		func(result lastfm.ComparisonResult) error {
+			if result.Status == lastfm.ComparisonStatusMissing {
+				missing = append(missing, result.Play)
+			} else {
+				matchedCount++
+			}
+			eligibleCount++
+			return nil
+		},
+	)
+	if err != nil {
+		return failImport(fmt.Errorf("import comparison: %w", err))
+	}
+	events = appendComparisonEvents(events, summary, matchedCount, eligibleCount)
+
+	fmt.Fprintf(stdout, "Import summary for profile %q\n", profileName)
+	fmt.Fprintf(stdout, "Total Spotify plays: %d\n", ingestionSummary.Records)
+	fmt.Fprintf(stdout, "Skipped duplicates: %d\n", summary.Matched)
+	fmt.Fprintf(stdout, "Missing plays: %d\n", summary.Missing)
+	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", from.In(location).Format("2006-01-02"), to.In(location).Format("2006-01-02"))
+	fmt.Fprintf(stdout, "Timestamp tolerance: %s\n", summary.TimestampTolerance)
+	if options.dryRun {
+		fmt.Fprintln(stdout, "Dry run: no Last.fm submissions will be sent.")
+	}
+
+	if len(missing) == 0 {
+		fmt.Fprintln(stdout, "Nothing to submit.")
+		events = append(events, journal.Event{Type: "run.completed", Timestamp: time.Now().UTC()})
+		if err := recordEvents(); err != nil {
+			fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if len(missing) > LargeImportConfirmationThreshold && !options.dryRun && !options.yes {
+		fmt.Fprintf(stdout, "Importing more than %d missing plays requires confirmation. Continue? [y/N] ", LargeImportConfirmationThreshold)
+		input := dependencies.Input
+		if input == nil {
+			input = os.Stdin
+		}
+		answer, readErr := bufio.NewReader(input).ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return failImport(fmt.Errorf("read import confirmation: %w", readErr))
+		}
+		answer = strings.TrimSpace(strings.ToLower(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(stdout, "Import cancelled.")
+			events = append(events, journal.Event{
+				Type: "run.failed", Timestamp: time.Now().UTC(),
+				Data: map[string]string{"failure_id": invocationID + ":cancelled", "message": "import cancelled"},
+			})
+			if err := recordEvents(); err != nil {
+				fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
+				return 1
+			}
+			return 1
+		}
+	}
+
+	submissionOptions := dependencies.Submission
+	submissionOptions.BaselineDelay = submissionDelay
+	submissionOptions.BaselineDelaySet = true
 	service := lastfm.NewSubmissionService(dependencies.LastFMClient, store, submissionOptions)
 	authenticated := lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey}
 	if options.dryRun {
 		if err := service.PlanSpotify(context.Background(), run, missing); err != nil {
-			fmt.Fprintf(stderr, "error: plan import batches: %v\n", err)
+			return failImport(fmt.Errorf("plan import batches: %w", err))
+		}
+		currentRun, openErr := store.OpenRun(profileName, invocationID)
+		if openErr != nil {
+			return failImport(fmt.Errorf("read planned import journal: %w", openErr))
+		}
+		events = appendBatchOutcomeEvents(events, currentRun)
+		events = append(events, journal.Event{Type: "run.completed", Timestamp: time.Now().UTC()})
+		if err := recordEvents(); err != nil {
+			fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
 			return 1
 		}
 		fmt.Fprintln(stdout, "Planned missing plays in the import journal; no batches submitted.")
 		return 0
 	}
 	if err := service.SubmitSpotify(context.Background(), authenticated, run, missing); err != nil {
-		fmt.Fprintf(stderr, "error: submit import batches: %v\n", err)
+		currentRun, openErr := store.OpenRun(profileName, invocationID)
+		if openErr == nil {
+			events = appendBatchOutcomeEvents(events, currentRun)
+			for _, batch := range currentRun.Batches {
+				if batch.State == journal.StatePlanned {
+					failureBatch = strconv.Itoa(batch.Sequence)
+					events = append(events, journal.Event{
+						Type: "submission.batch.failed", Timestamp: time.Now().UTC(),
+						Data: map[string]string{"batch": strconv.Itoa(batch.Sequence), "message": redactImportError(err.Error(), sessionKey)},
+					})
+					break
+				}
+			}
+		}
+		return failImport(fmt.Errorf("submit import batches: %w", err))
+	}
+	currentRun, openErr := store.OpenRun(profileName, invocationID)
+	if openErr != nil {
+		return failImport(fmt.Errorf("read completed import journal: %w", openErr))
+	}
+	events = appendBatchOutcomeEvents(events, currentRun)
+	events = append(events, journal.Event{Type: "run.completed", Timestamp: time.Now().UTC()})
+	if err := recordEvents(); err != nil {
+		fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "Submitted %d missing plays.\n", len(missing))
 	return 0
+}
+
+func runReport(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if len(command) > 1 {
+		fmt.Fprintln(stderr, "error: report accepts at most one invocation id")
+		return 2
+	}
+	if dependencies.ConfigStore == nil {
+		fmt.Fprintln(stderr, "error: configuration store is unavailable")
+		return 1
+	}
+	cfg, err := dependencies.ConfigStore.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: load configuration: %v\n", err)
+		return 1
+	}
+	profileName, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	store := dependencies.JournalStore
+	if store == nil {
+		store, err = journal.NewDefaultStore()
+		if err != nil {
+			fmt.Fprintf(stderr, "error: create report journal: %v\n", err)
+			return 1
+		}
+	}
+	var run journal.Run
+	if len(command) == 1 {
+		run, err = store.OpenRun(profileName, command[0])
+	} else {
+		var runs []journal.Run
+		runs, err = store.ListRuns(profileName)
+		if len(runs) > 0 {
+			run = runs[len(runs)-1]
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "error: read report journal: %v\n", err)
+		return 1
+	}
+	if run.InvocationID == "" {
+		fmt.Fprintf(stderr, "error: no journal run found for profile %q\n", profileName)
+		return 1
+	}
+	location := time.Local
+	from, err := parseAnalysisDate(options.from, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	to, err := parseAnalysisDate(options.to, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	reportOptions := report.Options{
+		Format: options.reportFormat, From: from, To: to, Location: location,
+		TimestampTolerance:    options.timestampTolerance,
+		TimestampToleranceSet: options.timestampToleranceSet,
+		BatchDelay:            options.batchDelay, BatchDelaySet: options.batchDelaySet,
+	}
+	if !run.Settings.TimestampToleranceSet && run.Settings.TimestampTolerance == 0 &&
+		!reportOptions.TimestampToleranceSet {
+		reportOptions.TimestampTolerance = cfg.TimestampTolerance
+		reportOptions.TimestampToleranceSet = true
+	}
+	if !run.Settings.BatchDelaySet && run.Settings.BatchDelay == 0 &&
+		!reportOptions.BatchDelaySet {
+		reportOptions.BatchDelay = cfg.BatchDelay
+		reportOptions.BatchDelaySet = true
+	}
+	if dependencies.CredentialStore != nil {
+		if secret, loadErr := dependencies.CredentialStore.Load(profileName); loadErr == nil {
+			reportOptions.Secrets = []string{secret}
+		}
+	}
+	data, err := report.Render(run, reportOptions)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: render report: %v\n", err)
+		return 1
+	}
+	_, err = stdout.Write(data)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: write report: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func resolveSubmissionDelay(cfg config.Config, options options, configured lastfm.SubmissionOptions) time.Duration {
+	var delay time.Duration
+	if options.batchDelaySet {
+		delay = options.batchDelay
+	} else if configured.BaselineDelaySet || configured.BaselineDelay != 0 {
+		delay = configured.BaselineDelay
+	} else if cfg.BatchDelay != 0 {
+		delay = cfg.BatchDelay
+	} else {
+		delay = lastfm.DefaultSubmissionDelay
+	}
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func warningEventData(warning spotify.Warning) map[string]string {
+	data := map[string]string{
+		"input": warning.Input, "code": warning.Code,
+		"reason": warning.Reason, "severity": warning.Severity,
+	}
+	if warning.Record != 0 {
+		data["record"] = strconv.Itoa(warning.Record)
+	}
+	if warning.Field != "" {
+		data["field"] = warning.Field
+	}
+	return data
+}
+
+func appendComparisonEvents(events []journal.Event, summary lastfm.ComparisonSummary, matched, eligible int) []journal.Event {
+	if eligible > 0 {
+		events = append(events, journal.Event{
+			Type: "comparison.eligible", Timestamp: time.Now().UTC(),
+			Data: map[string]string{"count": strconv.Itoa(eligible)},
+		})
+	}
+	if matched > 0 {
+		events = append(events, journal.Event{
+			Type: "comparison.matched", Timestamp: time.Now().UTC(),
+			Data: map[string]string{"count": strconv.Itoa(matched)},
+		})
+	}
+	reasons := make([]string, 0, len(summary.ExcludedByReason))
+	for reason := range summary.ExcludedByReason {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	for _, reason := range reasons {
+		events = append(events, journal.Event{
+			Type: "comparison.excluded", Timestamp: time.Now().UTC(),
+			Data: map[string]string{"reason": reason, "count": strconv.Itoa(summary.ExcludedByReason[reason])},
+		})
+	}
+	return events
+}
+
+func appendBatchOutcomeEvents(events []journal.Event, run journal.Run) []journal.Event {
+	for _, batch := range run.Batches {
+		data := map[string]string{
+			"batch": strconv.Itoa(batch.Sequence),
+			"count": strconv.Itoa(len(batch.Payloads)),
+		}
+		events = append(events, journal.Event{
+			Type: "submission.batch.planned", Timestamp: batch.PlannedAt, Data: data,
+		})
+		if batch.State == journal.StateSubmitted {
+			events = append(events, journal.Event{
+				Type: "submission.batch.submitted", Timestamp: submittedTimestamp(batch), Data: data,
+			})
+		}
+	}
+	return events
+}
+
+func submittedTimestamp(batch journal.Batch) time.Time {
+	if batch.SubmittedAt != nil {
+		return *batch.SubmittedAt
+	}
+	return batch.PlannedAt
+}
+
+func redactImportError(message, sessionKey string) string {
+	if sessionKey == "" {
+		return message
+	}
+	return strings.ReplaceAll(message, sessionKey, "[redacted]")
 }
 
 func runVerify(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
@@ -1006,6 +1323,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] report (--json|--csv|--html) [<invocation-id>]")
 	fmt.Fprintf(w, "  import confirms interactively when more than %d missing plays would be submitted; --yes bypasses confirmation.\n", LargeImportConfirmationThreshold)
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)
@@ -1014,5 +1332,6 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --log-level <level>  set logging to normal, verbose, or debug")
 	fmt.Fprintln(w, "  --verbose         enable verbose logging")
 	fmt.Fprintln(w, "  --debug           enable debug logging")
+	fmt.Fprintln(w, "  --json/--csv/--html  select exactly one report format")
 	fmt.Fprintln(w, "  --help            show this help")
 }
