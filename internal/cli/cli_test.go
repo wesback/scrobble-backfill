@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/credentials"
@@ -479,6 +480,114 @@ func TestAuthenticatedCommandRequestUsesResolvedProfileCredentialAndSignature(t 
 	}, apiSecret)
 	if got := received.Get("api_sig"); got != wantSignature {
 		t.Fatalf("api signature = %q, want %q", got, wantSignature)
+	}
+}
+
+func TestHistoryRequestUsesAuthenticatedClientEstablishedByLoginContract(t *testing.T) {
+	const (
+		apiKey     = "app-key"
+		apiSecret  = "app-secret"
+		sessionKey = "login-session"
+	)
+	start := time.Unix(1788307200, 0).UTC()
+	end := time.Unix(1788307260, 0).UTC()
+	var historyRequest url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("request method = %s, want POST", r.Method)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "auth.getToken":
+			fmt.Fprint(w, `{"token":"login-token"}`)
+		case "auth.getSession":
+			if got := r.PostForm.Get("token"); got != "login-token" {
+				t.Errorf("auth.getSession token = %q, want login-token", got)
+			}
+			fmt.Fprint(w, `{"session":{"name":"alice","key":"login-session"}}`)
+		case "user.getRecentTracks":
+			historyRequest = r.PostForm
+			fmt.Fprint(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Track","date":{"uts":"1788307200"}}],"@attr":{"totalPages":"1"}}}`)
+		default:
+			http.Error(w, "unexpected method", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	store := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
+	credentialsStore := &commandCredentialStore{}
+	client := lastfm.NewClient(apiKey, apiSecret)
+	client.BaseURL = server.URL
+	client.OpenURL = func(string) error { return nil }
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(
+		[]string{"--profile", "personal", "login"},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     store,
+			CredentialStore: credentialsStore,
+			LastFMClient:    client,
+			Input:           strings.NewReader("\n"),
+		},
+	); exitCode != 0 {
+		t.Fatalf("login exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load configuration after login: %v", err)
+	}
+	profile, err := cfg.ResolveProfile("personal")
+	if err != nil {
+		t.Fatalf("resolve logged-in profile: %v", err)
+	}
+	storedSession, err := credentialsStore.Load("personal")
+	if err != nil {
+		t.Fatalf("load logged-in session: %v", err)
+	}
+
+	var got []lastfm.Scrobble
+	err = lastfm.ReadHistory(context.Background(), client, lastfm.AuthenticatedProfile{
+		Username:   profile.LastFMUsername,
+		SessionKey: storedSession,
+	}, start, end, func(scrobble lastfm.Scrobble) error {
+		got = append(got, scrobble)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read authenticated history: %v", err)
+	}
+	if len(got) != 1 || got[0].Artist != "Artist" || got[0].Track != "Track" || !got[0].Timestamp.Equal(start) {
+		t.Fatalf("history = %#v, want one scrobble at %s", got, start)
+	}
+	if got := historyRequest.Get("user"); got != "alice" {
+		t.Fatalf("history username = %q, want alice", got)
+	}
+	if got := historyRequest.Get("sk"); got != sessionKey {
+		t.Fatalf("history session = %q, want stored login session", got)
+	}
+	if got := historyRequest.Get("from"); got != fmt.Sprint(start.Unix()) {
+		t.Fatalf("history from = %q, want %d", got, start.Unix())
+	}
+	if got := historyRequest.Get("to"); got != fmt.Sprint(end.Unix()) {
+		t.Fatalf("history to = %q, want %d", got, end.Unix())
+	}
+	wantSignature := signedRequestSignature(map[string]string{
+		"api_key": apiKey,
+		"from":    fmt.Sprint(start.Unix()),
+		"method":  "user.getRecentTracks",
+		"page":    "1",
+		"sk":      sessionKey,
+		"to":      fmt.Sprint(end.Unix()),
+		"user":    "alice",
+	}, apiSecret)
+	if got := historyRequest.Get("api_sig"); got != wantSignature {
+		t.Fatalf("history API signature = %q, want %q", got, wantSignature)
 	}
 }
 
