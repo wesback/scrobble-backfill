@@ -134,6 +134,13 @@ type EventBatchRecorder interface {
 	RecordEvents(profile, invocationID string, events []Event) error
 }
 
+// ReadOnlyStore is the optional read-only capability used by diagnostics.
+// Implementations must not create or modify journal state while checking
+// readability.
+type ReadOnlyStore interface {
+	CheckReadable(profile string) error
+}
+
 // FileStore persists each profile's runs in a separate JSON file below Root.
 // Files are named from a hex encoding of the profile, so valid profile names
 // cannot escape Root or collide through path separators.
@@ -478,6 +485,20 @@ func (s *FileStore) ListRuns(profile string) ([]Run, error) {
 		return nil, err
 	}
 	return cloneRuns(doc.Runs), nil
+}
+
+// CheckReadable validates a profile journal without acquiring a lock or
+// creating the journal directory. A missing journal is readable because a
+// profile may not have imported anything yet.
+func (s *FileStore) CheckReadable(profile string) error {
+	if err := validateProfile(profile); err != nil {
+		return err
+	}
+	if err := s.validatePath(); err != nil {
+		return err
+	}
+	_, err := s.load(profile)
+	return err
 }
 
 type document struct {
