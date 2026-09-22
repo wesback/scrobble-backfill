@@ -28,7 +28,7 @@ jobs:
             goarch: amd64
             binary: rescrobble-windows-amd64.exe
           - name: macOS amd64
-            runner: macos-13
+            runner: macos-15-intel
             goos: darwin
             goarch: amd64
             binary: rescrobble-darwin-amd64
