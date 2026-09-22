@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFileStorePersistsAcrossReload(t *testing.T) {
@@ -14,7 +15,9 @@ func TestFileStorePersistsAcrossReload(t *testing.T) {
 			"personal": {Name: "personal", DisplayName: "Personal", LastFMUsername: "alice"},
 			"family":   {Name: "family", DisplayName: "Family", LastFMUsername: "family-account"},
 		},
-		ActiveProfile: "personal",
+		ActiveProfile:      "personal",
+		TimestampTolerance: 45 * time.Second,
+		BatchDelay:         250 * time.Millisecond,
 	}
 
 	if err := store.Save(initial); err != nil {
@@ -29,6 +32,12 @@ func TestFileStorePersistsAcrossReload(t *testing.T) {
 	}
 	if got := reloaded.Profiles["family"].LastFMUsername; got != "family-account" {
 		t.Fatalf("family username = %q, want family-account", got)
+	}
+	if reloaded.TimestampTolerance != initial.TimestampTolerance {
+		t.Fatalf("timestamp tolerance = %s, want %s", reloaded.TimestampTolerance, initial.TimestampTolerance)
+	}
+	if reloaded.BatchDelay != initial.BatchDelay {
+		t.Fatalf("batch delay = %s, want %s", reloaded.BatchDelay, initial.BatchDelay)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/journal"
 	"github.com/wesback/scrobble-backfill/internal/spotify"
 )
@@ -18,7 +19,7 @@ const (
 
 	// DefaultSubmissionDelay is deliberately conservative. Callers can
 	// replace it with a shorter value in tests or a configured value later.
-	DefaultSubmissionDelay = time.Second
+	DefaultSubmissionDelay = config.DefaultBatchDelay
 
 	// DefaultSubmissionMaxRetries is the number of retries after the initial
 	// request. The retry delays are delay, delay*2, and so on.
@@ -39,6 +40,9 @@ type SubmissionOptions struct {
 	// BaselineDelay is used between ordinary batch requests and as the first
 	// retry delay. Zero selects DefaultSubmissionDelay.
 	BaselineDelay time.Duration
+	// BaselineDelaySet distinguishes an explicitly selected zero delay from an
+	// omitted delay, which uses DefaultSubmissionDelay.
+	BaselineDelaySet bool
 	// MaxRetries is the number of retries after the initial request. Zero
 	// selects DefaultSubmissionMaxRetries.
 	MaxRetries int
@@ -274,7 +278,7 @@ func (s *SubmissionService) wait(ctx context.Context, delay time.Duration) error
 }
 
 func normalizeSubmissionOptions(options SubmissionOptions) SubmissionOptions {
-	if options.BaselineDelay == 0 {
+	if options.BaselineDelay == 0 && !options.BaselineDelaySet {
 		options.BaselineDelay = DefaultSubmissionDelay
 	}
 	if options.BaselineDelay < 0 {

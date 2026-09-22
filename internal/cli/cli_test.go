@@ -161,7 +161,7 @@ func TestLogLevelOptionRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
-func TestAnalyseUsesDefaultTimestampTolerance(t *testing.T) {
+func TestAnalyseUsesPersistedTimestampToleranceAndPreservesItWhenOverridden(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "history.json")
 	writeSpotifyAnalysisExport(t, exportPath, `{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Track","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:track"}`)
@@ -179,8 +179,9 @@ func TestAnalyseUsesDefaultTimestampTolerance(t *testing.T) {
 
 	store := config.NewFileStore(filepath.Join(root, "config.json"))
 	if err := store.Save(config.Config{
-		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
-		ActiveProfile: "personal",
+		Profiles:           map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile:      "personal",
+		TimestampTolerance: 25 * time.Second,
 	}); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
@@ -200,11 +201,130 @@ func TestAnalyseUsesDefaultTimestampTolerance(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "Timestamp tolerance: 1m0s") {
-		t.Fatalf("stdout = %q, want default tolerance", stdout.String())
+	if !strings.Contains(stdout.String(), "Timestamp tolerance: 25s") {
+		t.Fatalf("stdout = %q, want persisted tolerance", stdout.String())
 	}
 	if len(methods) != 1 || methods[0] != "user.getRecentTracks" {
 		t.Fatalf("Last.fm methods = %#v, want history only", methods)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	exitCode = RunWithDependencies(
+		[]string{"analyse", "--from", "2024-01-02", "--to", "2024-01-02", "--timestamp-tolerance", "5s", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     store,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+			LastFMClient:    client,
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("overridden analyse exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Timestamp tolerance: 5s") {
+		t.Fatalf("stdout = %q, want invocation override", stdout.String())
+	}
+	reloaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("reload config after override: %v", err)
+	}
+	if reloaded.TimestampTolerance != 25*time.Second {
+		t.Fatalf("stored timestamp tolerance = %s, want 25s", reloaded.TimestampTolerance)
+	}
+}
+
+func TestImportUsesPersistedDefaultsAndCommandLineOverridesWithoutSavingThem(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	records := make([]string, 51)
+	for index := range records {
+		records[index] = fmt.Sprintf(`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Track %02d","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:track-%02d"}`, index, index)
+	}
+	writeSpotifyAnalysisExport(t, exportPath, records...)
+
+	var submissionCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			submissionCalls++
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:           map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile:      "personal",
+		TimestampTolerance: 15 * time.Second,
+		BatchDelay:         250 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var delays []time.Duration
+	dependencies := Dependencies{
+		ConfigStore:     configStore,
+		CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+		LastFMClient:    client,
+		JournalStore:    journalStore,
+		Submission: lastfm.SubmissionOptions{
+			Sleep: func(_ context.Context, delay time.Duration) error {
+				delays = append(delays, delay)
+				return nil
+			},
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"import", "--from", "2024-01-02", "--to", "2024-01-02", exportPath}
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("persisted-default import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Timestamp tolerance: 15s") {
+		t.Fatalf("stdout = %q, want persisted timestamp tolerance", stdout.String())
+	}
+	if !reflect.DeepEqual(delays, []time.Duration{250 * time.Millisecond}) {
+		t.Fatalf("submission delays = %v, want persisted batch delay", delays)
+	}
+	if submissionCalls != 2 {
+		t.Fatalf("submission calls = %d, want two batches", submissionCalls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	delays = nil
+	overrideArgs := []string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--timestamp-tolerance", "5s", "--batch-delay", "0s", exportPath}
+	if exitCode := RunWithDependencies(overrideArgs, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("overridden import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Timestamp tolerance: 5s") {
+		t.Fatalf("stdout = %q, want timestamp override", stdout.String())
+	}
+	if len(delays) != 0 {
+		t.Fatalf("submission delays after zero override = %v, want none", delays)
+	}
+	if submissionCalls != 4 {
+		t.Fatalf("submission calls after override = %d, want four total batches", submissionCalls)
+	}
+	reloaded, err := configStore.Load()
+	if err != nil {
+		t.Fatalf("reload config after import overrides: %v", err)
+	}
+	if reloaded.TimestampTolerance != 15*time.Second || reloaded.BatchDelay != 250*time.Millisecond {
+		t.Fatalf("stored defaults after overrides = tolerance %s, delay %s; want 15s and 250ms", reloaded.TimestampTolerance, reloaded.BatchDelay)
 	}
 }
 

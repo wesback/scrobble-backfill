@@ -8,13 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/spotify"
 )
 
 const (
 	// DefaultTimestampTolerance is used when a comparison request does not
 	// provide a tolerance.
-	DefaultTimestampTolerance = 60 * time.Second
+	DefaultTimestampTolerance = config.DefaultTimestampTolerance
 
 	// ExactTimestampWindow is the maximum drift considered near-exact.
 	ExactTimestampWindow = 5 * time.Second

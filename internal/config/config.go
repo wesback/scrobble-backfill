@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -21,6 +22,14 @@ const (
 	ConfigPathEnv  = "RESCOBBLE_CONFIG"
 	configDirName  = "rescrobble"
 	configFileName = "config.json"
+
+	// DefaultTimestampTolerance is the persisted comparison tolerance used
+	// when a command does not provide an invocation-specific value.
+	DefaultTimestampTolerance = 60 * time.Second
+
+	// DefaultBatchDelay is the persisted delay between Last.fm submission
+	// batches when a command does not provide an invocation-specific value.
+	DefaultBatchDelay = time.Second
 )
 
 // Profile contains identity and other non-secret metadata for a named
@@ -34,8 +43,10 @@ type Profile struct {
 
 // Config is the on-disk configuration document.
 type Config struct {
-	Profiles      map[string]Profile `json:"profiles"`
-	ActiveProfile string             `json:"active_profile,omitempty"`
+	Profiles           map[string]Profile `json:"profiles"`
+	ActiveProfile      string             `json:"active_profile,omitempty"`
+	TimestampTolerance time.Duration      `json:"timestamp_tolerance,omitempty"`
+	BatchDelay         time.Duration      `json:"batch_delay,omitempty"`
 }
 
 // Store is the persistence boundary used by commands. Implementations must
@@ -107,6 +118,7 @@ func (s *FileStore) Load() (Config, error) {
 	if cfg.Profiles == nil {
 		cfg.Profiles = make(map[string]Profile)
 	}
+	cfg = cfg.withDefaults()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("validate configuration %q: %w", s.Path, err)
 	}
@@ -120,6 +132,7 @@ func (s *FileStore) Save(cfg Config) error {
 	if s == nil || strings.TrimSpace(s.Path) == "" {
 		return errors.New("configuration path is empty")
 	}
+	cfg = cfg.withDefaults()
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("validate configuration: %w", err)
 	}
@@ -166,12 +179,32 @@ func (s *FileStore) Save(cfg Config) error {
 
 // NewConfig returns an initialized empty configuration.
 func NewConfig() Config {
-	return Config{Profiles: make(map[string]Profile)}
+	return Config{
+		Profiles:           make(map[string]Profile),
+		TimestampTolerance: DefaultTimestampTolerance,
+		BatchDelay:         DefaultBatchDelay,
+	}
+}
+
+func (c Config) withDefaults() Config {
+	if c.TimestampTolerance == 0 {
+		c.TimestampTolerance = DefaultTimestampTolerance
+	}
+	if c.BatchDelay == 0 {
+		c.BatchDelay = DefaultBatchDelay
+	}
+	return c
 }
 
 // Validate checks profile names and the active-profile reference. It does not
 // inspect or accept credentials.
 func (c Config) Validate() error {
+	if c.TimestampTolerance < 0 {
+		return errors.New("timestamp tolerance must not be negative")
+	}
+	if c.BatchDelay < 0 {
+		return errors.New("batch delay must not be negative")
+	}
 	for name := range c.Profiles {
 		if err := validateName(name); err != nil {
 			return fmt.Errorf("profile %q: %w", name, err)
