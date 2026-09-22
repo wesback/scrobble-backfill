@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/credentials"
+	"github.com/wesback/scrobble-backfill/internal/journal"
 	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
 	"github.com/wesback/scrobble-backfill/internal/spotify"
@@ -51,10 +53,17 @@ type Dependencies struct {
 	ConfigStore     config.Store
 	CredentialStore credentials.Store
 	LastFMClient    *lastfm.Client
+	JournalStore    journal.Store
+	Submission      lastfm.SubmissionOptions
 	Input           io.Reader
 }
 
 const secureStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service)"
+
+// LargeImportConfirmationThreshold is the largest missing-play count that
+// imports submit without an interactive confirmation. Larger imports require
+// confirmation unless --yes is supplied.
+const LargeImportConfirmationThreshold = 100
 
 // RunWithDependencies executes the command line application with injected
 // configuration, credentials, Last.fm client, and input boundaries.
@@ -73,9 +82,14 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		printUsage(stderr)
 		return 2
 	}
-	if command[0] != "analyse" &&
+	if command[0] != "analyse" && command[0] != "import" &&
 		(options.from != "" || options.to != "" || options.timestampToleranceSet) {
-		fmt.Fprintln(stderr, "error: --from, --to, and --timestamp-tolerance are only valid with analyse")
+		fmt.Fprintln(stderr, "error: --from, --to, and --timestamp-tolerance are only valid with analyse or import")
+		printUsage(stderr)
+		return 2
+	}
+	if command[0] != "import" && (options.dryRun || options.yes) {
+		fmt.Fprintln(stderr, "error: --dry-run and --yes are only valid with import")
 		printUsage(stderr)
 		return 2
 	}
@@ -106,6 +120,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		return runStatus(options, stdout, stderr, dependencies)
 	case "analyse":
 		return runAnalyse(command[1:], options, stdout, stderr, dependencies)
+	case "import":
+		return runImport(command[1:], options, stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", command[0])
 		printUsage(stderr)
@@ -122,6 +138,8 @@ type options struct {
 	to                    string
 	timestampTolerance    time.Duration
 	timestampToleranceSet bool
+	dryRun                bool
+	yes                   bool
 }
 
 func parseArgs(args []string) (options, []string, error) {
@@ -171,6 +189,10 @@ func parseArgs(args []string) (options, []string, error) {
 			if strings.TrimSpace(options.profile) == "" {
 				return options, nil, errors.New("--profile requires a non-empty name")
 			}
+		case arg == "--dry-run":
+			options.dryRun = true
+		case arg == "--yes":
+			options.yes = true
 		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", arg)
@@ -436,6 +458,7 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 		fmt.Fprintln(stderr, "usage: rescrobble [options] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
 		return 2
 	}
+
 	if dependencies.ConfigStore == nil {
 		fmt.Fprintln(stderr, "error: configuration store is unavailable")
 		return 1
@@ -553,6 +576,176 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 	return 0
 }
 
+func runImport(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if len(command) == 0 {
+		fmt.Fprintln(stderr, "error: import requires at least one Spotify export input")
+		fmt.Fprintln(stderr, "usage: rescrobble [options] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--yes] <export>...")
+		return 2
+	}
+	if dependencies.ConfigStore == nil {
+		fmt.Fprintln(stderr, "error: configuration store is unavailable")
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	if dependencies.LastFMClient == nil {
+		fmt.Fprintln(stderr, "error: Last.fm client is unavailable")
+		return 1
+	}
+
+	cfg, err := dependencies.ConfigStore.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: load configuration: %v\n", err)
+		return 1
+	}
+	profileName, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	profile := cfg.Profiles[profileName]
+	sessionKey, err := dependencies.CredentialStore.Load(profileName)
+	if errors.Is(err, credentials.ErrCredentialNotFound) {
+		fmt.Fprintf(stderr, "error: profile %q is not logged in\n", profileName)
+		return 1
+	}
+	if err != nil {
+		printCredentialError(stderr, fmt.Sprintf("load %q credential", profileName), err)
+		return 1
+	}
+	if strings.TrimSpace(sessionKey) == "" {
+		fmt.Fprintf(stderr, "error: stored %q credential is empty\n", profileName)
+		return 1
+	}
+	if strings.TrimSpace(profile.LastFMUsername) == "" {
+		fmt.Fprintf(stderr, "error: profile %q has no Last.fm username; log in again\n", profileName)
+		return 1
+	}
+
+	location := time.Local
+	from, err := parseAnalysisDate(options.from, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	to, err := parseAnalysisDate(options.to, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	paths := append([]string(nil), command...)
+	if from.IsZero() || to.IsZero() {
+		discoveredFrom, discoveredTo, discoverErr := discoverAnalysisBounds(paths, location)
+		if discoverErr != nil {
+			fmt.Fprintf(stderr, "error: %v\n", discoverErr)
+			return 1
+		}
+		if from.IsZero() {
+			from = discoveredFrom
+		}
+		if to.IsZero() {
+			to = discoveredTo
+		}
+	}
+
+	var ingestionSummary spotify.Summary
+	missing := make([]spotify.Play, 0)
+	summary, err := lastfm.Compare(
+		context.Background(),
+		dependencies.LastFMClient,
+		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
+		lastfm.ComparisonRequest{
+			From:                  from,
+			To:                    to,
+			Timezone:              location,
+			TimestampTolerance:    options.timestampTolerance,
+			TimestampToleranceSet: options.timestampToleranceSet,
+			Plays: func(ctx context.Context, consume spotify.Consumer) error {
+				var ingestErr error
+				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
+					fmt.Fprintf(stderr, "warning: %s: %s\n", warning.Code, warning.Reason)
+				})
+				return ingestErr
+			},
+		},
+		func(result lastfm.ComparisonResult) error {
+			if result.Status == lastfm.ComparisonStatusMissing {
+				missing = append(missing, result.Play)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: import comparison: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Import summary for profile %q\n", profileName)
+	fmt.Fprintf(stdout, "Total Spotify plays: %d\n", ingestionSummary.Records)
+	fmt.Fprintf(stdout, "Skipped duplicates: %d\n", summary.Matched)
+	fmt.Fprintf(stdout, "Missing plays: %d\n", summary.Missing)
+	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", from.In(location).Format("2006-01-02"), to.In(location).Format("2006-01-02"))
+	fmt.Fprintf(stdout, "Timestamp tolerance: %s\n", summary.TimestampTolerance)
+	if options.dryRun {
+		fmt.Fprintln(stdout, "Dry run: no Last.fm submissions will be sent.")
+	}
+
+	if len(missing) == 0 {
+		fmt.Fprintln(stdout, "Nothing to submit.")
+		return 0
+	}
+	if len(missing) > LargeImportConfirmationThreshold && !options.dryRun && !options.yes {
+		fmt.Fprintf(stdout, "Importing more than %d missing plays requires confirmation. Continue? [y/N] ", LargeImportConfirmationThreshold)
+		input := dependencies.Input
+		if input == nil {
+			input = os.Stdin
+		}
+		answer, readErr := bufio.NewReader(input).ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			fmt.Fprintf(stderr, "error: read import confirmation: %v\n", readErr)
+			return 1
+		}
+		answer = strings.TrimSpace(strings.ToLower(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(stdout, "Import cancelled.")
+			return 1
+		}
+	}
+
+	store := dependencies.JournalStore
+	if store == nil {
+		store, err = journal.NewDefaultStore()
+		if err != nil {
+			fmt.Fprintf(stderr, "error: create import journal: %v\n", err)
+			return 1
+		}
+	}
+	invocationID := fmt.Sprintf("import-%d", time.Now().UTC().UnixNano())
+	run, err := store.CreateRun(profileName, invocationID)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: create import journal run: %v\n", err)
+		return 1
+	}
+	service := lastfm.NewSubmissionService(dependencies.LastFMClient, store, dependencies.Submission)
+	authenticated := lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey}
+	if options.dryRun {
+		if err := service.PlanSpotify(context.Background(), run, missing); err != nil {
+			fmt.Fprintf(stderr, "error: plan import batches: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "Planned missing plays in the import journal; no batches submitted.")
+		return 0
+	}
+	if err := service.SubmitSpotify(context.Background(), authenticated, run, missing); err != nil {
+		fmt.Fprintf(stderr, "error: submit import batches: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "Submitted %d missing plays.\n", len(missing))
+	return 0
+}
+
 func parseAnalysisDate(value string, location *time.Location) (time.Time, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -618,6 +811,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] logout")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--yes] <export>...")
+	fmt.Fprintf(w, "  import confirms interactively when more than %d missing plays would be submitted; --yes bypasses confirmation.\n", LargeImportConfirmationThreshold)
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Global options:")

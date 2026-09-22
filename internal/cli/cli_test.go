@@ -19,6 +19,7 @@ import (
 
 	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/credentials"
+	"github.com/wesback/scrobble-backfill/internal/journal"
 	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
 )
@@ -313,6 +314,237 @@ func TestAnalyseReportsProfileBoundsConfidenceAndExclusionsWithoutMutatingState(
 	}
 	if len(methods) == 0 {
 		t.Fatal("analyse did not request Last.fm history")
+	}
+}
+
+func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	base := time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC)
+	writeSpotifyAnalysisExport(t, exportPath,
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Duplicate","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:duplicate"}`, base.Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Missing","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:missing"}`, base.Format(time.RFC3339)),
+	)
+
+	var historyCalls, submissionCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			historyCalls++
+			if got := r.PostForm.Get("user"); got != "work-user" {
+				t.Errorf("history user = %q, want work-user", got)
+			}
+			if got := r.PostForm.Get("from"); got != fmt.Sprint(time.Date(2024, 1, 2, 0, 0, 0, 0, time.Local).UTC().Unix()) {
+				t.Errorf("history from = %q, want local start", got)
+			}
+			if got := r.PostForm.Get("to"); got != fmt.Sprint(time.Date(2024, 1, 3, 0, 0, 0, 0, time.Local).UTC().Add(-time.Nanosecond).Unix()) {
+				t.Errorf("history to = %q, want inclusive local end", got)
+			}
+			if historyCalls <= 2 {
+				fmt.Fprintf(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Duplicate","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix())
+				return
+			}
+			fmt.Fprintf(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Duplicate","date":{"uts":"%d"}},{"artist":{"#text":"Artist"},"name":"Missing","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix(), base.Unix())
+		case "track.scrobble":
+			submissionCalls++
+			if got := r.PostForm.Get("track[0]"); got != "Missing" {
+				t.Errorf("submitted track = %q, want Missing", got)
+			}
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer server.Close()
+
+	store := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := store.Save(config.Config{
+		Profiles: map[string]config.Profile{
+			"personal": {Name: "personal", LastFMUsername: "personal-user"},
+			"work":     {Name: "work", LastFMUsername: "work-user"},
+		},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	args := []string{"--profile", "work", "import", "--from", "2024-01-02", "--to", "2024-01-02", exportPath}
+	dependencies := Dependencies{
+		ConfigStore:     store,
+		CredentialStore: &commandCredentialStore{sessions: map[string]string{"work": "work-session"}},
+		LastFMClient:    client,
+		JournalStore:    journal.NewFileStore(filepath.Join(root, "journal")),
+		Submission:      lastfm.SubmissionOptions{BaselineDelay: 0},
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("first import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Skipped duplicates: 1") || !strings.Contains(stdout.String(), "Missing plays: 1") {
+		t.Fatalf("first import output = %q, want duplicate and missing counts", stdout.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("second import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Skipped duplicates: 2") || !strings.Contains(stdout.String(), "Nothing to submit.") {
+		t.Fatalf("second import output = %q, want fresh live comparison counts", stdout.String())
+	}
+	if historyCalls != 4 {
+		t.Fatalf("history calls = %d, want history retrieval during both live comparisons", historyCalls)
+	}
+	if submissionCalls != 1 {
+		t.Fatalf("submission calls = %d, want only the first missing play submitted", submissionCalls)
+	}
+}
+
+func TestImportDryRunPlansBatchesWithoutSubmissionOrMarkingSubmitted(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeSpotifyAnalysisExport(t, exportPath, `{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Missing","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:missing"}`)
+	var submissionCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			submissionCalls++
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--dry-run", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+			LastFMClient:    client,
+			JournalStore:    journalStore,
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("dry-run exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if submissionCalls != 0 {
+		t.Fatalf("submission calls = %d, want zero for dry-run", submissionCalls)
+	}
+	runs, err := journalStore.ListRuns("personal")
+	if err != nil {
+		t.Fatalf("list dry-run journal: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("dry-run runs = %d, want one planned run", len(runs))
+	}
+	resume, err := journalStore.Resume("personal", runs[0].InvocationID)
+	if err != nil {
+		t.Fatalf("resume dry-run journal: %v", err)
+	}
+	if len(resume.Pending) != 1 || len(resume.Submitted) != 0 {
+		t.Fatalf("dry-run journal = submitted %#v pending %#v, want one planned batch and none submitted", resume.Submitted, resume.Pending)
+	}
+}
+
+func TestImportConfirmationThresholdAndYesOverride(t *testing.T) {
+	tests := []struct {
+		name       string
+		count      int
+		args       []string
+		input      string
+		wantExit   int
+		wantPrompt bool
+	}{
+		{name: "rejection above threshold", count: LargeImportConfirmationThreshold + 1, input: "n\n", wantExit: 1, wantPrompt: true},
+		{name: "acceptance above threshold", count: LargeImportConfirmationThreshold + 1, input: "y\n", wantExit: 0, wantPrompt: true},
+		{name: "threshold boundary does not prompt", count: LargeImportConfirmationThreshold, input: "n\n", wantExit: 0, wantPrompt: false},
+		{name: "yes bypasses prompt", count: LargeImportConfirmationThreshold + 1, args: []string{"--yes"}, input: "n\n", wantExit: 0, wantPrompt: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			exportPath := filepath.Join(root, "history.json")
+			records := make([]string, test.count)
+			for index := range records {
+				records[index] = `{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Track","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:track"}`
+			}
+			writeSpotifyAnalysisExport(t, exportPath, records...)
+			var submissionCalls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Errorf("parse form: %v", err)
+					return
+				}
+				switch r.PostForm.Get("method") {
+				case "user.getRecentTracks":
+					fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+				case "track.scrobble":
+					submissionCalls++
+					fmt.Fprint(w, `{}`)
+				default:
+					t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+				}
+			}))
+			defer server.Close()
+			configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+			if err := configStore.Save(config.Config{
+				Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+				ActiveProfile: "personal",
+			}); err != nil {
+				t.Fatalf("seed config: %v", err)
+			}
+			client := lastfm.NewClient("app-key", "app-secret")
+			client.BaseURL = server.URL
+			args := append([]string{"import", "--from", "2024-01-02", "--to", "2024-01-02"}, test.args...)
+			args = append(args, exportPath)
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDependencies(args, &stdout, &stderr, Dependencies{
+				ConfigStore:     configStore,
+				CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+				LastFMClient:    client,
+				JournalStore:    journal.NewFileStore(filepath.Join(root, "journal")),
+				Submission:      lastfm.SubmissionOptions{BaselineDelay: 0},
+				Input:           strings.NewReader(test.input),
+			})
+			if exitCode != test.wantExit {
+				t.Fatalf("exit code = %d, want %d; stdout=%q stderr=%q", exitCode, test.wantExit, stdout.String(), stderr.String())
+			}
+			gotPrompt := strings.Contains(stdout.String(), "requires confirmation")
+			if gotPrompt != test.wantPrompt {
+				t.Fatalf("prompt shown = %v, want %v; stdout=%q", gotPrompt, test.wantPrompt, stdout.String())
+			}
+			if test.wantExit == 1 && submissionCalls != 0 {
+				t.Fatalf("rejected import made %d submission calls", submissionCalls)
+			}
+			if test.wantExit == 0 && submissionCalls == 0 {
+				t.Fatal("accepted import made no submission calls")
+			}
+		})
 	}
 }
 

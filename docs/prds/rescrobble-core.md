@@ -199,9 +199,10 @@ progress reporting.
 
 Because a single `import` run can involve submitting a very large
 number of scrobbles (e.g. months of a broken integration), `import`
-prompts for interactive confirmation before submitting when it detects
-a large number of missing scrobbles, showing the same kind of summary
-`analyse` would show. `--yes` skips this prompt for scripted/CI use.
+prompts for interactive confirmation before submitting when more than
+100 missing scrobbles are detected, showing the same kind of summary
+`analyse` would show. Imports of 100 or fewer missing scrobbles do not
+prompt. `--yes` skips this prompt for scripted/CI use.
 `--dry-run` performs the entire comparison and would-be-submission
 planning without making any network write, useful both as a safety
 check ahead of a real run and as part of automation.
