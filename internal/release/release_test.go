@@ -15,6 +15,7 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 		"goos: linux",
 		"runner: windows-2022",
 		"runner: macos-13",
+		"runner: macos-14",
 		"runner: ubuntu-24.04",
 	} {
 		if !strings.Contains(workflow, target) {
@@ -24,6 +25,7 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 	for _, binary := range []string{
 		"rescrobble-windows-amd64.exe",
 		"rescrobble-darwin-amd64",
+		"rescrobble-darwin-arm64",
 		"rescrobble-linux-amd64",
 	} {
 		if !strings.Contains(workflow, binary) {
@@ -56,8 +58,28 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 			t.Errorf("release workflow does not validate %q", command)
 		}
 	}
-	if strings.Count(workflow, "binary: ") != 3 {
-		t.Errorf("release workflow defines %d binaries, want exactly 3", strings.Count(workflow, "binary: "))
+	for _, target := range []string{
+		"goos: darwin\n            goarch: arm64\n            binary: rescrobble-darwin-arm64",
+	} {
+		if !strings.Contains(workflow, target) {
+			t.Errorf("release workflow does not define %q", target)
+		}
+	}
+	if strings.Count(workflow, "binary: ") != 4 {
+		t.Errorf("release workflow defines %d binaries, want exactly 4", strings.Count(workflow, "binary: "))
+	}
+	checksumStart := strings.Index(workflow, "binaries=(\n")
+	if checksumStart == -1 {
+		t.Fatal("release workflow does not define a checksum binary list")
+	}
+	checksumEnd := strings.Index(workflow[checksumStart:], "\n          )")
+	if checksumEnd == -1 {
+		t.Fatal("release workflow does not define a checksum binary list")
+	}
+	checksumBinaries := workflow[checksumStart : checksumStart+checksumEnd]
+	if strings.Count(checksumBinaries, "rescrobble-darwin-arm64") != 1 {
+		t.Errorf("checksum binary list contains rescrobble-darwin-arm64 %d times, want exactly once",
+			strings.Count(checksumBinaries, "rescrobble-darwin-arm64"))
 	}
 	if !strings.Contains(workflow, "uses: actions/attest-build-provenance@v2") ||
 		!strings.Contains(workflow, "subject-path: ${{ matrix.binary }}") {
@@ -69,6 +91,7 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 	for _, asset := range []string{
 		"release-assets/rescrobble-windows-amd64.exe",
 		"release-assets/rescrobble-darwin-amd64",
+		"release-assets/rescrobble-darwin-arm64",
 		"release-assets/rescrobble-linux-amd64",
 		"release-assets/SHA256SUMS",
 	} {
@@ -111,14 +134,18 @@ func TestReleaseDocumentationDefinesGitHubOnlyMVPDistribution(t *testing.T) {
 			"Docker",
 			"rescrobble-windows-amd64.exe",
 			"rescrobble-darwin-amd64",
+			"rescrobble-darwin-arm64",
 			"rescrobble-linux-amd64",
+			"Apple Silicon macOS",
 			`.\rescrobble-windows-amd64.exe --help`,
 			"./rescrobble-darwin-amd64 --help",
+			"./rescrobble-darwin-arm64 --help",
 			"./rescrobble-linux-amd64 --help",
 			"SHA256SUMS",
 			"sha256sum --ignore-missing -c SHA256SUMS",
 			"gh attestation verify ./rescrobble-windows-amd64.exe --repo wesback/scrobble-backfill",
 			"gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill",
+			"gh attestation verify ./rescrobble-darwin-arm64 --repo wesback/scrobble-backfill",
 			"gh attestation verify ./rescrobble-linux-amd64 --repo wesback/scrobble-backfill",
 		} {
 			if !strings.Contains(documentation, required) {

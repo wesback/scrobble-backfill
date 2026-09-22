@@ -21,10 +21,10 @@ report      render a journaled run as JSON, CSV, or HTML
 profile use select the active named profile
 ```
 
-Rescrobble supports Windows, macOS, and Linux on the `amd64` release builds.
-It is MIT-licensed; see [LICENSE](LICENSE). Homebrew, Scoop, Docker, and
-other package-manager distributions are explicitly deferred for this
-release.
+Rescrobble supports Windows, Intel macOS, Apple Silicon macOS, and Linux on
+the published release builds. It is MIT-licensed; see [LICENSE](LICENSE).
+Homebrew, Scoop, Docker, and other package-manager distributions are
+explicitly deferred for this release.
 
 ## Install
 
@@ -37,14 +37,15 @@ The supported assets are:
 | Platform | Asset | First invocation |
 | --- | --- | --- |
 | Windows | `rescrobble-windows-amd64.exe` | `.\rescrobble-windows-amd64.exe --help` |
-| macOS | `rescrobble-darwin-amd64` | `./rescrobble-darwin-amd64 --help` |
+| Intel macOS | `rescrobble-darwin-amd64` | `./rescrobble-darwin-amd64 --help` |
+| Apple Silicon macOS | `rescrobble-darwin-arm64` | `./rescrobble-darwin-arm64 --help` |
 | Linux | `rescrobble-linux-amd64` | `./rescrobble-linux-amd64 --help` |
 
 On macOS or Linux, make the downloaded file executable:
 
 ```sh
-chmod +x rescrobble-darwin-amd64   # use rescrobble-linux-amd64 on Linux
-./rescrobble-darwin-amd64 --help   # use rescrobble-linux-amd64 on Linux
+chmod +x rescrobble-darwin-arm64  # use the asset matching your platform
+./rescrobble-darwin-arm64 --help  # use the asset matching your platform
 ```
 
 Before executing a downloaded binary, download the release's `SHA256SUMS`
@@ -62,6 +63,7 @@ does not match. Also verify the signed build provenance with GitHub CLI:
 ```sh
 gh attestation verify ./rescrobble-windows-amd64.exe --repo wesback/scrobble-backfill
 gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill
+gh attestation verify ./rescrobble-darwin-arm64 --repo wesback/scrobble-backfill
 gh attestation verify ./rescrobble-linux-amd64 --repo wesback/scrobble-backfill
 ```
 
