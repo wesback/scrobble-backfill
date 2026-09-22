@@ -14,7 +14,7 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 		"goos: darwin",
 		"goos: linux",
 		"runner: windows-2022",
-		"runner: macos-13",
+		"runner: macos-15-intel",
 		"runner: macos-14",
 		"runner: ubuntu-24.04",
 	} {
