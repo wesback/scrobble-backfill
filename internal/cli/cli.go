@@ -123,6 +123,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		return runLogout(options, stdout, stderr, dependencies)
 	case "status":
 		return runStatus(options, stdout, stderr, dependencies)
+	case "doctor":
+		return runDoctor(options, stdout, stderr, dependencies)
 	case "analyse":
 		return runAnalyse(command[1:], options, stdout, stderr, dependencies)
 	case "import":
@@ -442,6 +444,188 @@ func runStatus(options options, stdout, stderr io.Writer, dependencies Dependenc
 		fmt.Fprintf(stdout, "profile %q: not logged in\n", profileName)
 	}
 	return 0
+}
+
+type doctorResult struct {
+	name string
+	err  error
+}
+
+var errDoctorCredentialEmpty = errors.New("stored credential is empty")
+
+func runDoctor(options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	fmt.Fprintln(stdout, "Rescrobble doctor")
+
+	cfg, configErr := loadDoctorConfig(dependencies.ConfigStore)
+	printDoctorResult(stdout, doctorResult{name: "configuration readability", err: configErr})
+	if configErr != nil {
+		printDoctorDependentFailures(stdout, "profile selection", "configuration is unreadable")
+		printDoctorDependentFailures(stdout, "secure keyring availability", "configuration is unreadable")
+		printDoctorDependentFailures(stdout, "credential presence and validity", "configuration is unreadable")
+		printDoctorDependentFailures(stdout, "Last.fm API reachability and authentication", "configuration is unreadable")
+		printDoctorDependentFailures(stdout, "journal readability", "configuration is unreadable")
+		return 1
+	}
+
+	profileName, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		printDoctorDependentFailures(stdout, "profile selection", err.Error())
+		printDoctorDependentFailures(stdout, "secure keyring availability", "no profile was selected")
+		printDoctorDependentFailures(stdout, "credential presence and validity", "no profile was selected")
+		printDoctorDependentFailures(stdout, "Last.fm API reachability and authentication", "no profile was selected")
+		printDoctorDependentFailures(stdout, "journal readability", "no profile was selected")
+		return 1
+	}
+	fmt.Fprintf(stdout, "Profile: %q\n", profileName)
+
+	sessionKey, credentialErr := loadDoctorCredential(dependencies.CredentialStore, profileName)
+	keyringErr := doctorKeyringError(credentialErr)
+	printDoctorResult(stdout, doctorResult{name: "secure keyring availability", err: keyringErr})
+
+	profile := cfg.Profiles[profileName]
+	apiErr := doctorAPIError(dependencies.LastFMClient, profile.LastFMUsername, sessionKey, credentialErr)
+	if credentialErr != nil {
+		printDoctorResult(stdout, doctorResult{name: "credential presence and validity", err: credentialDiagnosticError(credentialErr)})
+	} else if apiErr != nil && strings.Contains(strings.ToLower(apiErr.Error()), "authentication") {
+		printDoctorResult(stdout, doctorResult{name: "credential presence and validity", err: errors.New("stored credential was rejected; run login again")})
+	} else if apiErr != nil {
+		printDoctorResult(stdout, doctorResult{name: "credential presence and validity", err: errors.New("credential is present but its validity could not be checked")})
+	} else {
+		printDoctorResult(stdout, doctorResult{name: "credential presence and validity"})
+	}
+	printDoctorResult(stdout, doctorResult{name: "Last.fm API reachability and authentication", err: apiErr})
+
+	journalErr := checkDoctorJournal(dependencies.JournalStore, profileName)
+	printDoctorResult(stdout, doctorResult{name: "journal readability", err: journalErr})
+
+	if keyringErr != nil || credentialErr != nil || apiErr != nil || journalErr != nil {
+		return 1
+	}
+	return 0
+}
+
+func loadDoctorConfig(store config.Store) (config.Config, error) {
+	if store == nil {
+		return config.Config{}, errors.New("configuration store is unavailable")
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return config.Config{}, fmt.Errorf("read configuration: %w", err)
+	}
+	return cfg, nil
+}
+
+func loadDoctorCredential(store credentials.Store, profile string) (string, error) {
+	if store == nil {
+		return "", credentials.ErrSecureStoreUnavailable
+	}
+	session, err := store.Load(profile)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(session) == "" {
+		return "", errDoctorCredentialEmpty
+	}
+	return session, nil
+}
+
+func doctorKeyringError(err error) error {
+	if err == nil || errors.Is(err, credentials.ErrCredentialNotFound) || errors.Is(err, errDoctorCredentialEmpty) {
+		return nil
+	}
+	if errors.Is(err, credentials.ErrSecureStoreUnavailable) {
+		return fmt.Errorf("%s; %s", credentials.ErrSecureStoreUnavailable, secureStoreGuidance)
+	}
+	return errors.New("secure credential store could not be checked")
+}
+
+func credentialDiagnosticError(err error) error {
+	switch {
+	case errors.Is(err, credentials.ErrCredentialNotFound):
+		return errors.New("no stored credential; run login")
+	case errors.Is(err, credentials.ErrSecureStoreUnavailable):
+		return errors.New("secure credential store is unavailable")
+	default:
+		return errors.New("could not read stored credential; check the secure credential service")
+	}
+}
+
+func doctorAPIError(client *lastfm.Client, username, sessionKey string, credentialErr error) error {
+	if credentialErr != nil {
+		return errors.New("not checked because the profile credential is unavailable")
+	}
+	if strings.TrimSpace(username) == "" {
+		return errors.New("authentication cannot be checked; profile has no Last.fm username")
+	}
+	if client == nil {
+		return errors.New("Last.fm API client is unavailable; configure Last.fm API credentials")
+	}
+	_, err := client.Call(context.Background(), "user.getInfo", map[string]string{"user": username}, sessionKey)
+	if err == nil {
+		return nil
+	}
+	var apiErr *lastfm.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.Code == 9 {
+			return fmt.Errorf("Last.fm API authentication failed; run login again: %s", redactDiagnosticError(err, sessionKey))
+		}
+		return fmt.Errorf("Last.fm API returned an error: %s", redactDiagnosticError(err, sessionKey))
+	}
+	var httpErr *lastfm.HTTPError
+	if errors.As(err, &httpErr) {
+		return fmt.Errorf("Last.fm API is unreachable or not configured: %s", redactDiagnosticError(err, sessionKey))
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "send last.fm request") ||
+		strings.Contains(message, "create last.fm request") ||
+		strings.Contains(message, "parse last.fm api url") ||
+		strings.Contains(message, "last.fm client is not configured") {
+		return fmt.Errorf("Last.fm API is unreachable or not configured: %s", redactDiagnosticError(err, sessionKey))
+	}
+	return fmt.Errorf("Last.fm API request failed: %s", redactDiagnosticError(err, sessionKey))
+}
+
+func checkDoctorJournal(store journal.Store, profile string) error {
+	if store == nil {
+		var err error
+		store, err = journal.NewDefaultStore()
+		if err != nil {
+			return fmt.Errorf("create journal store: %w", err)
+		}
+	}
+	if readOnly, ok := store.(journal.ReadOnlyStore); ok {
+		if err := readOnly.CheckReadable(profile); err != nil {
+			return fmt.Errorf("journal is unreadable: %w", err)
+		}
+		return nil
+	}
+	if _, err := store.ListRuns(profile); err != nil {
+		return fmt.Errorf("journal is unreadable: %w", err)
+	}
+	return nil
+}
+
+func redactDiagnosticError(err error, secret string) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if secret != "" {
+		message = strings.ReplaceAll(message, secret, "[redacted]")
+	}
+	return message
+}
+
+func printDoctorResult(w io.Writer, result doctorResult) {
+	if result.err == nil {
+		fmt.Fprintf(w, "PASS: %s\n", result.name)
+		return
+	}
+	fmt.Fprintf(w, "FAIL: %s: %s\n", result.name, result.err)
+}
+
+func printDoctorDependentFailures(w io.Writer, name, reason string) {
+	printDoctorResult(w, doctorResult{name: name, err: errors.New(reason)})
 }
 
 func callAuthenticated(ctx context.Context, options options, method string, params map[string]string, dependencies Dependencies) (map[string]any, error) {
@@ -1003,6 +1187,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] login")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] logout")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] doctor")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
