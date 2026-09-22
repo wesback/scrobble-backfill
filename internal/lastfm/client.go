@@ -33,6 +33,18 @@ var (
 	ErrInvalidClient = errors.New("Last.fm client is not configured")
 )
 
+// HTTPError describes an unsuccessful HTTP response without retaining its
+// body. Keeping the response body out of the error prevents remote content
+// from accidentally echoing credentials or other request data.
+type HTTPError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("Last.fm returned HTTP %s", e.Status)
+}
+
 // Client is a Last.fm API client. API credentials are supplied by the
 // environment or by an injected test client and are never persisted.
 type Client struct {
@@ -215,7 +227,7 @@ func (c *Client) callJSON(ctx context.Context, method string, params map[string]
 		return nil, fmt.Errorf("read Last.fm response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("Last.fm returned HTTP %s", response.Status)
+		return nil, &HTTPError{StatusCode: response.StatusCode, Status: response.Status}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
