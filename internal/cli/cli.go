@@ -3,12 +3,16 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/wesback/scrobble-backfill/internal/config"
+	"github.com/wesback/scrobble-backfill/internal/credentials"
+	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
 )
 
@@ -27,6 +31,30 @@ func Run(args []string, stdout, stderr io.Writer) int {
 // It is useful for embedding and keeps command behavior independently
 // testable without changing the user's configuration.
 func RunWithStore(args []string, stdout, stderr io.Writer, store config.Store) int {
+	return RunWithDependencies(args, stdout, stderr, Dependencies{
+		ConfigStore:     store,
+		CredentialStore: credentials.NewDefaultStore(),
+		LastFMClient:    lastfm.NewClientFromEnv(),
+		Input:           os.Stdin,
+	})
+}
+
+// Dependencies contains the persistent and external boundaries used by
+// account commands. Production callers should use Run or RunWithStore;
+// injection keeps command behavior testable without weakening the secure
+// credential boundary.
+type Dependencies struct {
+	ConfigStore     config.Store
+	CredentialStore credentials.Store
+	LastFMClient    *lastfm.Client
+	Input           io.Reader
+}
+
+const secureStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service)"
+
+// RunWithDependencies executes the command line application with injected
+// configuration, credentials, Last.fm client, and input boundaries.
+func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies Dependencies) int {
 	options, command, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n\n", err)
@@ -59,7 +87,13 @@ func RunWithStore(args []string, stdout, stderr io.Writer, store config.Store) i
 
 	switch command[0] {
 	case "profile":
-		return runProfile(command[1:], options, stdout, stderr, store)
+		return runProfile(command[1:], options, stdout, stderr, dependencies.ConfigStore)
+	case "login":
+		return runLogin(options, stdout, stderr, dependencies)
+	case "logout":
+		return runLogout(options, stdout, stderr, dependencies)
+	case "status":
+		return runStatus(options, stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", command[0])
 		printUsage(stderr)
@@ -187,8 +221,179 @@ func runProfile(command []string, options options, stdout, stderr io.Writer, sto
 	return 0
 }
 
+func runLogin(options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if dependencies.ConfigStore == nil {
+		fmt.Fprintln(stderr, "error: configuration store is unavailable")
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	if dependencies.LastFMClient == nil {
+		fmt.Fprintln(stderr, "error: Last.fm client is unavailable")
+		return 1
+	}
+	cfg, err := dependencies.ConfigStore.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: load configuration: %v\n", err)
+		return 1
+	}
+	profileName, err := resolveLoginProfile(cfg, options.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	previousSession, previousErr := dependencies.CredentialStore.Load(profileName)
+	if previousErr != nil && !errors.Is(previousErr, credentials.ErrCredentialNotFound) {
+		printCredentialError(stderr, "load existing credential", previousErr)
+		return 1
+	}
+	session, err := dependencies.LastFMClient.Authenticate(context.Background(), stdout, dependencies.Input)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if err := dependencies.CredentialStore.Save(profileName, session.Key); err != nil {
+		printCredentialError(stderr, "save credential", err)
+		return 1
+	}
+
+	if cfg.Profiles == nil {
+		cfg.Profiles = make(map[string]config.Profile)
+	}
+	profile := cfg.Profiles[profileName]
+	profile.Name = profileName
+	if session.Name != "" {
+		profile.LastFMUsername = session.Name
+	}
+	cfg.Profiles[profileName] = profile
+	if cfg.ActiveProfile == "" {
+		cfg.ActiveProfile = profileName
+	}
+	if err := dependencies.ConfigStore.Save(cfg); err != nil {
+		rollbackErr := rollbackCredential(dependencies.CredentialStore, profileName, previousSession, previousErr)
+		if rollbackErr != nil {
+			fmt.Fprintf(stderr, "error: save configuration: %v; credential rollback failed: %v\n", err, rollbackErr)
+		} else {
+			fmt.Fprintf(stderr, "error: save configuration: %v\n", err)
+		}
+		return 1
+	}
+	fmt.Fprintf(stdout, "logged in to profile %q\n", profileName)
+	return 0
+}
+
+func runLogout(options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	profileName, err := resolveExistingProfile(options, dependencies.ConfigStore)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	if err := dependencies.CredentialStore.Delete(profileName); err != nil {
+		printCredentialError(stderr, fmt.Sprintf("delete %q credential", profileName), err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "logged out of profile %q\n", profileName)
+	return 0
+}
+
+func runStatus(options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	profileName, err := resolveExistingProfile(options, dependencies.ConfigStore)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	hasSession, err := dependencies.CredentialStore.Has(profileName)
+	if err != nil {
+		printCredentialError(stderr, fmt.Sprintf("check %q credential", profileName), err)
+		return 1
+	}
+	if hasSession {
+		fmt.Fprintf(stdout, "profile %q: logged in\n", profileName)
+	} else {
+		fmt.Fprintf(stdout, "profile %q: not logged in\n", profileName)
+	}
+	return 0
+}
+
+func callAuthenticated(ctx context.Context, options options, method string, params map[string]string, dependencies Dependencies) (map[string]any, error) {
+	if dependencies.LastFMClient == nil {
+		return nil, errors.New("Last.fm client is unavailable")
+	}
+	if dependencies.CredentialStore == nil {
+		return nil, errors.New("secure credential store is unavailable")
+	}
+	profileName, err := resolveExistingProfile(options, dependencies.ConfigStore)
+	if err != nil {
+		return nil, err
+	}
+	sessionKey, err := dependencies.CredentialStore.Load(profileName)
+	if errors.Is(err, credentials.ErrCredentialNotFound) {
+		return nil, fmt.Errorf("profile %q is not logged in", profileName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load %q credential: %w", profileName, err)
+	}
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil, fmt.Errorf("stored %q credential is empty", profileName)
+	}
+	return dependencies.LastFMClient.Call(ctx, method, params, sessionKey)
+}
+
+func resolveExistingProfile(options options, store config.Store) (string, error) {
+	if store == nil {
+		return "", errors.New("configuration store is unavailable")
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return "", fmt.Errorf("load configuration: %w", err)
+	}
+	name, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func printCredentialError(stderr io.Writer, action string, err error) {
+	if errors.Is(err, credentials.ErrSecureStoreUnavailable) {
+		fmt.Fprintf(stderr, "error: %s: %v; %s\n", action, credentials.ErrSecureStoreUnavailable, secureStoreGuidance)
+		return
+	}
+	fmt.Fprintf(stderr, "error: %s: %v\n", action, err)
+}
+
+func resolveLoginProfile(cfg config.Config, explicit string) (string, error) {
+	if name := strings.TrimSpace(explicit); name != "" {
+		return name, nil
+	}
+	if name := strings.TrimSpace(cfg.ActiveProfile); name != "" {
+		return name, nil
+	}
+	return "default", nil
+}
+
+func rollbackCredential(store credentials.Store, profile, previous string, previousErr error) error {
+	if previousErr == nil {
+		return store.Save(profile, previous)
+	}
+	return store.Delete(profile)
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] login")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] logout")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Global options:")
