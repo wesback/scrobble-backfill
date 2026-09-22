@@ -155,20 +155,66 @@ func (s *SubmissionService) SubmitSpotify(
 	run journal.Run,
 	plays []spotify.Play,
 ) error {
-	payloads := make([]journal.Submission, len(plays))
-	for index, play := range plays {
-		if play.Milliseconds < 0 {
-			return fmt.Errorf("Last.fm submission play %d duration must not be negative", index+1)
-		}
-		payloads[index] = journal.Submission{
-			Artist:    play.ArtistName,
-			Track:     play.TrackName,
-			Album:     play.AlbumName,
-			Timestamp: play.Timestamp,
-			Duration:  int(play.Milliseconds / 1000),
-		}
+	payloads, err := spotifySubmissionPayloads(plays)
+	if err != nil {
+		return err
 	}
 	return s.Submit(ctx, profile, run, payloads)
+}
+
+// PlanSpotify records the batches that SubmitSpotify would dispatch without
+// making any Last.fm request or marking a journal batch submitted. It is used
+// by dry-run callers that need durable batch planning.
+func (s *SubmissionService) PlanSpotify(ctx context.Context, run journal.Run, plays []spotify.Play) error {
+	payloads, err := spotifySubmissionPayloads(plays)
+	if err != nil {
+		return err
+	}
+	return s.Plan(ctx, run, payloads)
+}
+
+// Plan records all normalized submission batches without dispatching them.
+func (s *SubmissionService) Plan(ctx context.Context, run journal.Run, plays []journal.Submission) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil || s.journal == nil {
+		return errSubmissionJournalUnavailable
+	}
+	if strings.TrimSpace(run.Profile) == "" || strings.TrimSpace(run.InvocationID) == "" {
+		return errors.New("Last.fm submission journal run identity is incomplete")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	batches, err := submissionBatches(plays)
+	if err != nil {
+		return err
+	}
+	if len(batches) == 0 {
+		return nil
+	}
+	resume, err := s.journal.Resume(run.Profile, run.InvocationID)
+	if err != nil {
+		return fmt.Errorf("resume Last.fm submission journal: %w", err)
+	}
+	if len(resume.Run.Batches) > len(batches) {
+		return fmt.Errorf("Last.fm submission journal has %d batches for %d plays", len(resume.Run.Batches), len(plays))
+	}
+	for index, existing := range resume.Run.Batches {
+		if !sameSubmissionPayloads(existing.Payloads, batches[index]) {
+			return fmt.Errorf("Last.fm submission journal batch %d does not match ordered missing plays", existing.Sequence)
+		}
+	}
+	for index := len(resume.Run.Batches); index < len(batches); index++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := s.journal.PlanBatch(run.Profile, run.InvocationID, batches[index]); err != nil {
+			return fmt.Errorf("plan Last.fm submission batch %d: %w", index+1, err)
+		}
+	}
+	return nil
 }
 
 // SubmitMissing is the functional form of SubmissionService.Submit.
@@ -182,6 +228,23 @@ func SubmitMissing(
 	options ...SubmissionOptions,
 ) error {
 	return NewSubmissionService(client, store, options...).Submit(ctx, profile, run, plays)
+}
+
+func spotifySubmissionPayloads(plays []spotify.Play) ([]journal.Submission, error) {
+	payloads := make([]journal.Submission, len(plays))
+	for index, play := range plays {
+		if play.Milliseconds < 0 {
+			return nil, fmt.Errorf("Last.fm submission play %d duration must not be negative", index+1)
+		}
+		payloads[index] = journal.Submission{
+			Artist:    play.ArtistName,
+			Track:     play.TrackName,
+			Album:     play.AlbumName,
+			Timestamp: play.Timestamp,
+			Duration:  int(play.Milliseconds / 1000),
+		}
+	}
+	return payloads, nil
 }
 
 func (s *SubmissionService) dispatch(ctx context.Context, profile AuthenticatedProfile, batch journal.Batch) error {
