@@ -33,6 +33,19 @@ var (
 	ErrInvalidClient = errors.New("Last.fm client is not configured")
 )
 
+// APIError describes an error returned by the Last.fm API.
+type APIError struct {
+	Code    int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	if e == nil {
+		return "Last.fm API error"
+	}
+	return fmt.Sprintf("Last.fm API error %d: %s", e.Code, e.Message)
+}
+
 // HTTPError describes an unsuccessful HTTP response without retaining its
 // body. Keeping the response body out of the error prevents remote content
 // from accidentally echoing credentials or other request data.
@@ -235,7 +248,7 @@ func (c *Client) callJSON(ctx context.Context, method string, params map[string]
 	}
 	if code, ok := payload["error"].(float64); ok {
 		message, _ := payload["message"].(string)
-		return nil, fmt.Errorf("Last.fm API error %d: %s", int(code), message)
+		return nil, &APIError{Code: int(code), Message: message}
 	}
 	return payload, nil
 }
