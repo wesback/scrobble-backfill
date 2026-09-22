@@ -63,14 +63,36 @@ type Batch struct {
 	SubmittedAt *time.Time   `json:"submitted_at,omitempty"`
 }
 
+// RunSettings records the non-secret options that produced a run. The set
+// flags distinguish an explicit zero from an older journal without settings.
+type RunSettings struct {
+	From                  time.Time     `json:"from,omitempty"`
+	To                    time.Time     `json:"to,omitempty"`
+	TimestampTolerance    time.Duration `json:"timestamp_tolerance,omitempty"`
+	TimestampToleranceSet bool          `json:"timestamp_tolerance_set,omitempty"`
+	EligibilityRule       string        `json:"eligibility_rule,omitempty"`
+	BatchDelay            time.Duration `json:"batch_delay,omitempty"`
+	BatchDelaySet         bool          `json:"batch_delay_set,omitempty"`
+}
+
+// Event is a portable, non-secret outcome in a run. Data values must contain
+// diagnostics and counts only; credentials are never part of this boundary.
+type Event struct {
+	Type      string            `json:"type"`
+	Timestamp time.Time         `json:"timestamp"`
+	Data      map[string]string `json:"data,omitempty"`
+}
+
 // Run is an immutable invocation identity and its append-only batch journal.
 // Profile and InvocationID are never changed after CreateRun succeeds.
 type Run struct {
-	Profile      string    `json:"profile"`
-	InvocationID string    `json:"invocation_id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	Batches      []Batch   `json:"batches"`
+	Profile      string      `json:"profile"`
+	InvocationID string      `json:"invocation_id"`
+	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+	Settings     RunSettings `json:"settings,omitempty"`
+	Batches      []Batch     `json:"batches"`
+	Events       []Event     `json:"events,omitempty"`
 }
 
 // Resume describes what a restarted invocation can do next. Submitted contains
@@ -92,6 +114,24 @@ type Store interface {
 	MarkSubmitted(profile, invocationID string, sequence int) error
 	Resume(profile, invocationID string) (Resume, error)
 	ListRuns(profile string) ([]Run, error)
+}
+
+// MetadataStore persists the settings associated with a run. It is optional
+// so existing journal.Store implementations remain source-compatible.
+type MetadataStore interface {
+	SetRunSettings(profile, invocationID string, settings RunSettings) error
+}
+
+// EventRecorder is the structured event boundary used by imports and reports.
+type EventRecorder interface {
+	RecordEvent(profile, invocationID string, event Event) error
+}
+
+// EventBatchRecorder can persist several events in one journal transaction.
+// FileStore implements it to avoid rewriting the profile journal for every
+// comparison result.
+type EventBatchRecorder interface {
+	RecordEvents(profile, invocationID string, events []Event) error
 }
 
 // ReadOnlyStore is the optional read-only capability used by diagnostics.
@@ -198,6 +238,89 @@ func (s *FileStore) OpenRun(profile, invocationID string) (Run, error) {
 	}
 	defer func() { _ = lock.Close() }()
 	return s.findRun(profile, invocationID)
+}
+
+// SetRunSettings records the non-secret invocation settings for a run.
+func (s *FileStore) SetRunSettings(profile, invocationID string, settings RunSettings) error {
+	if err := validateIdentity(profile, invocationID); err != nil {
+		return err
+	}
+	if err := s.validatePath(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := s.acquireProfileLock(profile)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Close() }()
+	doc, err := s.load(profile)
+	if err != nil {
+		return err
+	}
+	index := findRunIndex(doc.Runs, invocationID)
+	if index < 0 {
+		return fmt.Errorf("%w: %q for profile %q", ErrRunNotFound, invocationID, profile)
+	}
+	doc.Runs[index].Settings = cloneRunSettings(settings)
+	doc.Runs[index].UpdatedAt = time.Now().UTC()
+	if err := s.save(profile, doc); err != nil && !isCommittedSaveError(err) {
+		return err
+	}
+	return nil
+}
+
+// RecordEvent appends one structured outcome to a run.
+func (s *FileStore) RecordEvent(profile, invocationID string, event Event) error {
+	return s.RecordEvents(profile, invocationID, []Event{event})
+}
+
+// RecordEvents appends structured outcomes in one durable journal update.
+func (s *FileStore) RecordEvents(profile, invocationID string, events []Event) error {
+	if err := validateIdentity(profile, invocationID); err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	if err := s.validatePath(); err != nil {
+		return err
+	}
+	normalized := make([]Event, len(events))
+	for index, event := range events {
+		if strings.TrimSpace(event.Type) == "" {
+			return fmt.Errorf("journal event %d type must not be empty", index+1)
+		}
+		if event.Timestamp.IsZero() {
+			event.Timestamp = time.Now().UTC()
+		}
+		event.Timestamp = event.Timestamp.UTC()
+		event.Data = cloneEventData(event.Data)
+		normalized[index] = event
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := s.acquireProfileLock(profile)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Close() }()
+	doc, err := s.load(profile)
+	if err != nil {
+		return err
+	}
+	index := findRunIndex(doc.Runs, invocationID)
+	if index < 0 {
+		return fmt.Errorf("%w: %q for profile %q", ErrRunNotFound, invocationID, profile)
+	}
+	run := &doc.Runs[index]
+	run.Events = append(run.Events, normalized...)
+	run.UpdatedAt = time.Now().UTC()
+	if err := s.save(profile, doc); err != nil && !isCommittedSaveError(err) {
+		return err
+	}
+	return nil
 }
 
 // PlanBatch records one normalized batch before a caller may dispatch it.
@@ -611,6 +734,8 @@ func findBatchIndex(batches []Batch, sequence int) int {
 
 func cloneRun(run Run) Run {
 	run.Batches = cloneBatches(run.Batches)
+	run.Settings = cloneRunSettings(run.Settings)
+	run.Events = cloneEvents(run.Events)
 	return run
 }
 
@@ -635,6 +760,33 @@ func cloneBatches(batches []Batch) []Batch {
 	cloned := make([]Batch, len(batches))
 	for i, batch := range batches {
 		cloned[i] = cloneBatch(batch)
+	}
+	return cloned
+}
+
+func cloneRunSettings(settings RunSettings) RunSettings {
+	return settings
+}
+
+func cloneEventData(data map[string]string) map[string]string {
+	if data == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(data))
+	for key, value := range data {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneEvents(events []Event) []Event {
+	if events == nil {
+		return nil
+	}
+	cloned := make([]Event, len(events))
+	for index, event := range events {
+		cloned[index] = event
+		cloned[index].Data = cloneEventData(event.Data)
 	}
 	return cloned
 }

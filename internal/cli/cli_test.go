@@ -592,6 +592,145 @@ func TestImportDryRunPlansBatchesWithoutSubmissionOrMarkingSubmitted(t *testing.
 	}
 }
 
+func TestReportSelectsExactlyOneFormatFromJournalRun(t *testing.T) {
+	root := t.TempDir()
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+	run, err := journalStore.CreateRun("personal", "import-report")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := journalStore.SetRunSettings("personal", run.InvocationID, journal.RunSettings{
+		From:                  time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		To:                    time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		TimestampTolerance:    20 * time.Second,
+		TimestampToleranceSet: true,
+		EligibilityRule:       "test eligibility rule",
+		BatchDelay:            150 * time.Millisecond,
+		BatchDelaySet:         true,
+	}); err != nil {
+		t.Fatalf("set run settings: %v", err)
+	}
+	if err := journalStore.RecordEvents("personal", run.InvocationID, []journal.Event{
+		{Type: "ingestion.warning", Data: map[string]string{
+			"input": "bad.json", "code": "malformed_record", "reason": "malformed Spotify input",
+		}},
+		{Type: "comparison.matched", Data: map[string]string{"count": "1"}},
+	}); err != nil {
+		t.Fatalf("record events: %v", err)
+	}
+	if _, err := journalStore.PlanBatch("personal", run.InvocationID, []journal.Submission{{
+		Artist: "Artist", Track: "Track", Timestamp: time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC),
+	}}); err != nil {
+		t.Fatalf("plan batch: %v", err)
+	}
+	if err := journalStore.MarkSubmitted("personal", run.InvocationID, 1); err != nil {
+		t.Fatalf("submit batch: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		flag string
+		want string
+	}{
+		{name: "json", flag: "--json", want: `"imported_scrobbles": 1`},
+		{name: "csv", flag: "--csv", want: "imported_scrobbles,1"},
+		{name: "html", flag: "--html", want: `data-field="imported_scrobbles"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDependencies(
+				[]string{"report", test.flag, run.InvocationID},
+				&stdout, &stderr,
+				Dependencies{ConfigStore: configStore, JournalStore: journalStore},
+			)
+			if exitCode != 0 {
+				t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), test.want) {
+				t.Fatalf("report = %q, want %q", stdout.String(), test.want)
+			}
+			for _, value := range []string{"personal", "2024-01-02", "20s", "150ms", "malformed Spotify input"} {
+				if !strings.Contains(stdout.String(), value) {
+					t.Fatalf("report = %q, want %q", stdout.String(), value)
+				}
+			}
+		})
+	}
+	var currentStdout, currentStderr bytes.Buffer
+	if exitCode := RunWithDependencies(
+		[]string{"report", "--json"},
+		&currentStdout, &currentStderr,
+		Dependencies{ConfigStore: configStore, JournalStore: journalStore},
+	); exitCode != 0 || !strings.Contains(currentStdout.String(), `"invocation_id": "import-report"`) {
+		t.Fatalf("current journal report exit code = %d, stdout=%q stderr=%q", exitCode, currentStdout.String(), currentStderr.String())
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(
+		[]string{"report", "--json", "--csv", run.InvocationID},
+		&stdout, &stderr, Dependencies{ConfigStore: configStore, JournalStore: journalStore},
+	); exitCode != 2 || !strings.Contains(stderr.String(), "exactly one") {
+		t.Fatalf("multiple formats exit code = %d, stderr = %q; want usage error", exitCode, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies(
+		[]string{"report", run.InvocationID},
+		&stdout, &stderr, Dependencies{ConfigStore: configStore, JournalStore: journalStore},
+	); exitCode != 2 || !strings.Contains(stderr.String(), "exactly one") {
+		t.Fatalf("missing format exit code = %d, stderr = %q; want usage error", exitCode, stderr.String())
+	}
+}
+
+func TestImportSurfacesJournalEventRecordingFailure(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeSpotifyAnalysisExport(t, exportPath, `{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Missing","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:missing"}`)
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+	}))
+	defer server.Close()
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	store := &failingEventJournalStore{FileStore: journal.NewFileStore(filepath.Join(root, "journal"))}
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--dry-run", exportPath},
+		&stdout, &stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session-secret"}},
+			LastFMClient:    client,
+			JournalStore:    store,
+		},
+	)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, stdout=%q stderr=%q; want recording failure", exitCode, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "record import outcome") ||
+		!strings.Contains(stderr.String(), "event write failed") {
+		t.Fatalf("stderr = %q, want surfaced event recording failure", stderr.String())
+	}
+}
+
 func TestVerifyReportsConfirmedAndMissingJournalEntriesReadOnly(t *testing.T) {
 	base := time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -881,6 +1020,18 @@ type commandCredentialStore struct {
 	loadErr   error
 	deleteErr error
 	hasErr    error
+}
+
+type failingEventJournalStore struct {
+	*journal.FileStore
+}
+
+func (s *failingEventJournalStore) RecordEvent(string, string, journal.Event) error {
+	return errors.New("event write failed")
+}
+
+func (s *failingEventJournalStore) RecordEvents(string, string, []journal.Event) error {
+	return errors.New("event write failed")
 }
 
 func (s *commandCredentialStore) Save(profile, session string) error {
