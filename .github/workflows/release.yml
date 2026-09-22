@@ -68,6 +68,10 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Generate release checksums
+        working-directory: release-assets
+        run: sha256sum rescrobble-* > SHA256SUMS
+
       - name: Upload Rescrobble binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
