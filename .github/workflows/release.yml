@@ -6,25 +6,34 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+  id-token: none
+  attestations: none
 
 jobs:
   build:
     name: Build ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows amd64
+            runner: windows-2022
             goos: windows
             goarch: amd64
             binary: rescrobble-windows-amd64.exe
           - name: macOS amd64
+            runner: macos-13
             goos: darwin
             goarch: amd64
             binary: rescrobble-darwin-amd64
           - name: Linux amd64
+            runner: ubuntu-24.04
             goos: linux
             goarch: amd64
             binary: rescrobble-linux-amd64
@@ -43,11 +52,32 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ github.ref_name }}
+        shell: bash
         run: |
           go build -trimpath \
             -ldflags "-X main.version=${VERSION}" \
             -o "${{ matrix.binary }}" \
             ./cmd/rescrobble
+
+      - name: Validate Rescrobble binary
+        env:
+          VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if ! ./"${{ matrix.binary }}" --help >/dev/null; then
+            echo "error: ${{ matrix.binary }} --help failed" >&2
+            exit 1
+          fi
+          actual_version="$(./"${{ matrix.binary }}" --version)"
+          if [[ "${actual_version}" != "${VERSION}" ]]; then
+            echo "error: expected version ${VERSION}, got ${actual_version}" >&2
+            exit 1
+          fi
+
+      - name: Attest Rescrobble build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.binary }}
 
       - name: Upload Rescrobble build artifact
         uses: actions/upload-artifact@v4
@@ -60,6 +90,8 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download Rescrobble build artifacts
         uses: actions/download-artifact@v4
@@ -68,8 +100,39 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Upload Rescrobble binaries to GitHub Release
+      - name: Generate release checksums
+        working-directory: release-assets
+        shell: bash
+        run: |
+          binaries=(
+            rescrobble-windows-amd64.exe
+            rescrobble-darwin-amd64
+            rescrobble-linux-amd64
+          )
+          for binary in "${binaries[@]}"; do
+            if [[ ! -f "${binary}" ]]; then
+              echo "error: missing release binary ${binary}" >&2
+              exit 1
+            fi
+          done
+          if [[ "$(find . -maxdepth 1 -type f | wc -l)" -ne "${#binaries[@]}" ]]; then
+            echo "error: release artifact directory contains unexpected files" >&2
+            exit 1
+          fi
+          sha256sum "${binaries[@]}" > SHA256SUMS
+          if [[ "$(wc -l < SHA256SUMS)" -ne 3 ]]; then
+            echo "error: SHA256SUMS does not contain exactly three entries" >&2
+            exit 1
+          fi
+
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/rescrobble-windows-amd64.exe
+            release-assets/rescrobble-darwin-amd64
+            release-assets/rescrobble-linux-amd64
+            release-assets/SHA256SUMS

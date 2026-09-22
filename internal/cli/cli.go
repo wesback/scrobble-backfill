@@ -1519,4 +1519,5 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --debug           enable debug logging")
 	fmt.Fprintln(w, "  --json/--csv/--html  select exactly one report format")
 	fmt.Fprintln(w, "  --help            show this help")
+	fmt.Fprintln(w, "  --version         show the application version")
 }
