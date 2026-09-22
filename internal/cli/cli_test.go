@@ -159,6 +159,171 @@ func TestLogLevelOptionRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
+func TestAnalyseUsesDefaultTimestampTolerance(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeSpotifyAnalysisExport(t, exportPath, `{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Track","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:track"}`)
+
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		methods = append(methods, r.PostForm.Get("method"))
+		fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+	}))
+	defer server.Close()
+
+	store := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := store.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	exitCode := RunWithDependencies(
+		[]string{"analyse", "--from", "2024-01-02", "--to", "2024-01-02", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     store,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+			LastFMClient:    client,
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Timestamp tolerance: 1m0s") {
+		t.Fatalf("stdout = %q, want default tolerance", stdout.String())
+	}
+	if len(methods) != 1 || methods[0] != "user.getRecentTracks" {
+		t.Fatalf("Last.fm methods = %#v, want history only", methods)
+	}
+}
+
+func TestAnalyseReportsProfileBoundsConfidenceAndExclusionsWithoutMutatingState(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeSpotifyAnalysisExport(t, exportPath,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Exact","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:exact"}`,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Medium","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:medium"}`,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Missing","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:missing"}`,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"episode_name":"Episode","episode_show_name":"Show","spotify_episode_uri":"spotify:episode:episode"}`,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Offline","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:offline","offline":true}`,
+	)
+
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		method := r.PostForm.Get("method")
+		methods = append(methods, method)
+		if method == "track.scrobble" || method == "track.updateNowPlaying" {
+			t.Errorf("analyse made a submission request: %q", method)
+		}
+		if method != "user.getRecentTracks" {
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+			return
+		}
+		if got := r.PostForm.Get("user"); got != "work-user" {
+			t.Errorf("history user = %q, want work-user", got)
+		}
+		if got := r.PostForm.Get("sk"); got != "work-session" {
+			t.Errorf("history session = %q, want work-session", got)
+		}
+		localStart := time.Date(2024, 1, 2, 0, 0, 0, 0, time.Local).UTC()
+		localEnd := time.Date(2024, 1, 3, 0, 0, 0, 0, time.Local).UTC().Add(-time.Nanosecond)
+		if got := r.PostForm.Get("from"); got != fmt.Sprint(localStart.Unix()) {
+			t.Errorf("history from = %q, want %d", got, localStart.Unix())
+		}
+		if got := r.PostForm.Get("to"); got != fmt.Sprint(localEnd.Unix()) {
+			t.Errorf("history to = %q, want %d", got, localEnd.Unix())
+		}
+		base := time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC)
+		fmt.Fprintf(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Exact","date":{"uts":"%d"}},{"artist":{"#text":"Artist"},"name":"Medium","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix(), base.Add(-10*time.Second).Unix())
+	}))
+	defer server.Close()
+
+	store := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := store.Save(config.Config{
+		Profiles: map[string]config.Profile{
+			"personal": {Name: "personal", LastFMUsername: "personal-user"},
+			"work":     {Name: "work", LastFMUsername: "work-user"},
+		},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	before, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatalf("read initial config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	exitCode := RunWithDependencies(
+		[]string{"--profile", "work", "analyse", "--from=2024-01-02", "--to=2024-01-02", "--timestamp-tolerance", "20s", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore: store,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{
+				"personal": "personal-session",
+				"work":     "work-session",
+			}},
+			LastFMClient: client,
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		`Analysis summary for profile "work"`,
+		"Total Spotify plays: 5",
+		"In-scope Last.fm scrobbles: 2",
+		"Estimated missing plays: 1",
+		"Covered date range: 2024-01-02 to 2024-01-02",
+		"Timestamp tolerance: 20s",
+		"Confidence: high=1 medium=1 low=1",
+		"excluded_podcast: 1",
+		"excluded_local_or_offline: 1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("stdout = %q, want %q", output, want)
+		}
+	}
+	after, err := os.ReadFile(store.Path)
+	if err != nil {
+		t.Fatalf("read final config: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("analyse mutated config: before %q, after %q", before, after)
+	}
+	if _, err := os.Stat(filepath.Join(root, "journal")); !os.IsNotExist(err) {
+		t.Fatalf("analyse created journal state: stat error = %v", err)
+	}
+	if len(methods) == 0 {
+		t.Fatal("analyse did not request Last.fm history")
+	}
+}
+
+func writeSpotifyAnalysisExport(t *testing.T, path string, records ...string) {
+	t.Helper()
+	data := "[" + strings.Join(records, ",") + "]"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("write Spotify export: %v", err)
+	}
+}
+
 type commandCredentialStore struct {
 	sessions  map[string]string
 	saveErr   error
