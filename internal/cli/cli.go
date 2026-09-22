@@ -88,6 +88,11 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		printUsage(stderr)
 		return 2
 	}
+	if command[0] != "import" && options.batchDelaySet {
+		fmt.Fprintln(stderr, "error: --batch-delay is only valid with import")
+		printUsage(stderr)
+		return 2
+	}
 	if command[0] != "import" && (options.dryRun || options.yes) {
 		fmt.Fprintln(stderr, "error: --dry-run and --yes are only valid with import")
 		printUsage(stderr)
@@ -140,6 +145,8 @@ type options struct {
 	to                    string
 	timestampTolerance    time.Duration
 	timestampToleranceSet bool
+	batchDelay            time.Duration
+	batchDelaySet         bool
 	dryRun                bool
 	yes                   bool
 }
@@ -195,20 +202,20 @@ func parseArgs(args []string) (options, []string, error) {
 			options.dryRun = true
 		case arg == "--yes":
 			options.yes = true
-		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance":
+		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance", arg == "--batch-delay":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", arg)
 			}
-			if err := setAnalysisOption(&options, arg, args[i+1]); err != nil {
+			if err := setOperationalOption(&options, arg, args[i+1]); err != nil {
 				return options, nil, err
 			}
 			i++
-		case strings.HasPrefix(arg, "--from="), strings.HasPrefix(arg, "--to="), strings.HasPrefix(arg, "--timestamp-tolerance="):
+		case strings.HasPrefix(arg, "--from="), strings.HasPrefix(arg, "--to="), strings.HasPrefix(arg, "--timestamp-tolerance="), strings.HasPrefix(arg, "--batch-delay="):
 			name, value, _ := strings.Cut(arg, "=")
 			if strings.TrimSpace(value) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", name)
 			}
-			if err := setAnalysisOption(&options, name, value); err != nil {
+			if err := setOperationalOption(&options, name, value); err != nil {
 				return options, nil, err
 			}
 		case strings.HasPrefix(arg, "-"):
@@ -220,7 +227,7 @@ func parseArgs(args []string) (options, []string, error) {
 	return options, command, nil
 }
 
-func setAnalysisOption(options *options, name, value string) error {
+func setOperationalOption(options *options, name, value string) error {
 	switch name {
 	case "--from":
 		options.from = value
@@ -233,8 +240,15 @@ func setAnalysisOption(options *options, name, value string) error {
 		}
 		options.timestampTolerance = tolerance
 		options.timestampToleranceSet = true
+	case "--batch-delay":
+		delay, err := parseBatchDelay(value)
+		if err != nil {
+			return err
+		}
+		options.batchDelay = delay
+		options.batchDelaySet = true
 	default:
-		return fmt.Errorf("unknown analysis option %q", name)
+		return fmt.Errorf("unknown operational option %q", name)
 	}
 	return nil
 }
@@ -252,6 +266,21 @@ func parseTimestampTolerance(value string) (time.Duration, error) {
 		return time.Duration(seconds) * time.Second, nil
 	}
 	return 0, fmt.Errorf("--timestamp-tolerance must be a non-negative duration (for example 60s): %w", err)
+}
+
+func parseBatchDelay(value string) (time.Duration, error) {
+	delay, err := time.ParseDuration(strings.TrimSpace(value))
+	if err == nil {
+		if delay < 0 {
+			return 0, errors.New("--batch-delay must not be negative")
+		}
+		return delay, nil
+	}
+	seconds, integerErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if integerErr == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, nil
+	}
+	return 0, fmt.Errorf("--batch-delay must be a non-negative duration (for example 1s): %w", err)
 }
 
 func runProfile(command []string, options options, stdout, stderr io.Writer, store config.Store) int {
@@ -528,6 +557,7 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 			to = discoveredTo
 		}
 	}
+	timestampTolerance, timestampToleranceSet := resolveTimestampTolerance(cfg, options)
 
 	var ingestionSummary spotify.Summary
 	exclusionCounts := make(map[string]int)
@@ -539,8 +569,8 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 			From:                  from,
 			To:                    to,
 			Timezone:              location,
-			TimestampTolerance:    options.timestampTolerance,
-			TimestampToleranceSet: options.timestampToleranceSet,
+			TimestampTolerance:    timestampTolerance,
+			TimestampToleranceSet: timestampToleranceSet,
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
 				var ingestErr error
 				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
@@ -581,7 +611,7 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 func runImport(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(command) == 0 {
 		fmt.Fprintln(stderr, "error: import requires at least one Spotify export input")
-		fmt.Fprintln(stderr, "usage: rescrobble [options] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--yes] <export>...")
+		fmt.Fprintln(stderr, "usage: rescrobble [options] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
 		return 2
 	}
 	if dependencies.ConfigStore == nil {
@@ -651,6 +681,7 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 			to = discoveredTo
 		}
 	}
+	timestampTolerance, timestampToleranceSet := resolveTimestampTolerance(cfg, options)
 
 	var ingestionSummary spotify.Summary
 	missing := make([]spotify.Play, 0)
@@ -662,8 +693,8 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 			From:                  from,
 			To:                    to,
 			Timezone:              location,
-			TimestampTolerance:    options.timestampTolerance,
-			TimestampToleranceSet: options.timestampToleranceSet,
+			TimestampTolerance:    timestampTolerance,
+			TimestampToleranceSet: timestampToleranceSet,
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
 				var ingestErr error
 				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
@@ -730,7 +761,15 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		fmt.Fprintf(stderr, "error: create import journal run: %v\n", err)
 		return 1
 	}
-	service := lastfm.NewSubmissionService(dependencies.LastFMClient, store, dependencies.Submission)
+	submissionOptions := dependencies.Submission
+	if options.batchDelaySet {
+		submissionOptions.BaselineDelay = options.batchDelay
+		submissionOptions.BaselineDelaySet = true
+	} else if cfg.BatchDelay != 0 {
+		submissionOptions.BaselineDelay = cfg.BatchDelay
+		submissionOptions.BaselineDelaySet = true
+	}
+	service := lastfm.NewSubmissionService(dependencies.LastFMClient, store, submissionOptions)
 	authenticated := lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey}
 	if options.dryRun {
 		if err := service.PlanSpotify(context.Background(), run, missing); err != nil {
@@ -902,6 +941,16 @@ func parseAnalysisDate(value string, location *time.Location) (time.Time, error)
 	return date, nil
 }
 
+func resolveTimestampTolerance(cfg config.Config, options options) (time.Duration, bool) {
+	if options.timestampToleranceSet {
+		return options.timestampTolerance, true
+	}
+	if cfg.TimestampTolerance != 0 {
+		return cfg.TimestampTolerance, true
+	}
+	return lastfm.DefaultTimestampTolerance, true
+}
+
 func discoverAnalysisBounds(paths []string, location *time.Location) (time.Time, time.Time, error) {
 	var first, last time.Time
 	_, err := spotify.IngestFiles(context.Background(), paths, func(play spotify.Play) error {
@@ -955,7 +1004,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] logout")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
-	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--dry-run] [--yes] <export>...")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
 	fmt.Fprintf(w, "  import confirms interactively when more than %d missing plays would be submitted; --yes bypasses confirmation.\n", LargeImportConfirmationThreshold)
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
