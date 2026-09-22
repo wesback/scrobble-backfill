@@ -8,12 +8,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wesback/scrobble-backfill/internal/config"
 	"github.com/wesback/scrobble-backfill/internal/credentials"
 	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
+	"github.com/wesback/scrobble-backfill/internal/spotify"
 )
 
 // Run executes the command line application using the default configuration
@@ -69,6 +73,12 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		printUsage(stderr)
 		return 2
 	}
+	if command[0] != "analyse" &&
+		(options.from != "" || options.to != "" || options.timestampToleranceSet) {
+		fmt.Fprintln(stderr, "error: --from, --to, and --timestamp-tolerance are only valid with analyse")
+		printUsage(stderr)
+		return 2
+	}
 	if options.logLevelExplicit {
 		logger := observability.NewLogger(stderr, options.logLevel)
 		if err := logger.Normal("command.started", map[string]any{"command": command[0]}); err != nil {
@@ -94,6 +104,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		return runLogout(options, stdout, stderr, dependencies)
 	case "status":
 		return runStatus(options, stdout, stderr, dependencies)
+	case "analyse":
+		return runAnalyse(command[1:], options, stdout, stderr, dependencies)
 	default:
 		fmt.Fprintf(stderr, "error: unknown command %q\n\n", command[0])
 		printUsage(stderr)
@@ -102,10 +114,14 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 }
 
 type options struct {
-	profile          string
-	logLevel         observability.Level
-	logLevelExplicit bool
-	help             bool
+	profile               string
+	logLevel              observability.Level
+	logLevelExplicit      bool
+	help                  bool
+	from                  string
+	to                    string
+	timestampTolerance    time.Duration
+	timestampToleranceSet bool
 }
 
 func parseArgs(args []string) (options, []string, error) {
@@ -155,6 +171,22 @@ func parseArgs(args []string) (options, []string, error) {
 			if strings.TrimSpace(options.profile) == "" {
 				return options, nil, errors.New("--profile requires a non-empty name")
 			}
+		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return options, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			if err := setAnalysisOption(&options, arg, args[i+1]); err != nil {
+				return options, nil, err
+			}
+			i++
+		case strings.HasPrefix(arg, "--from="), strings.HasPrefix(arg, "--to="), strings.HasPrefix(arg, "--timestamp-tolerance="):
+			name, value, _ := strings.Cut(arg, "=")
+			if strings.TrimSpace(value) == "" {
+				return options, nil, fmt.Errorf("%s requires a value", name)
+			}
+			if err := setAnalysisOption(&options, name, value); err != nil {
+				return options, nil, err
+			}
 		case strings.HasPrefix(arg, "-"):
 			return options, nil, fmt.Errorf("unknown option %q", arg)
 		default:
@@ -162,6 +194,40 @@ func parseArgs(args []string) (options, []string, error) {
 		}
 	}
 	return options, command, nil
+}
+
+func setAnalysisOption(options *options, name, value string) error {
+	switch name {
+	case "--from":
+		options.from = value
+	case "--to":
+		options.to = value
+	case "--timestamp-tolerance":
+		tolerance, err := parseTimestampTolerance(value)
+		if err != nil {
+			return err
+		}
+		options.timestampTolerance = tolerance
+		options.timestampToleranceSet = true
+	default:
+		return fmt.Errorf("unknown analysis option %q", name)
+	}
+	return nil
+}
+
+func parseTimestampTolerance(value string) (time.Duration, error) {
+	tolerance, err := time.ParseDuration(strings.TrimSpace(value))
+	if err == nil {
+		if tolerance < 0 {
+			return 0, errors.New("--timestamp-tolerance must not be negative")
+		}
+		return tolerance, nil
+	}
+	seconds, integerErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if integerErr == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second, nil
+	}
+	return 0, fmt.Errorf("--timestamp-tolerance must be a non-negative duration (for example 60s): %w", err)
 }
 
 func runProfile(command []string, options options, stdout, stderr io.Writer, store config.Store) int {
@@ -364,6 +430,163 @@ func resolveExistingProfile(options options, store config.Store) (string, error)
 	return name, nil
 }
 
+func runAnalyse(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+	if len(command) == 0 {
+		fmt.Fprintln(stderr, "error: analyse requires at least one Spotify export input")
+		fmt.Fprintln(stderr, "usage: rescrobble [options] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
+		return 2
+	}
+	if dependencies.ConfigStore == nil {
+		fmt.Fprintln(stderr, "error: configuration store is unavailable")
+		return 1
+	}
+	if dependencies.CredentialStore == nil {
+		fmt.Fprintf(stderr, "error: secure credential store is unavailable; %s\n", secureStoreGuidance)
+		return 1
+	}
+	if dependencies.LastFMClient == nil {
+		fmt.Fprintln(stderr, "error: Last.fm client is unavailable")
+		return 1
+	}
+
+	cfg, err := dependencies.ConfigStore.Load()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: load configuration: %v\n", err)
+		return 1
+	}
+	profileName, err := cfg.ResolveProfileName(options.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	profile := cfg.Profiles[profileName]
+	sessionKey, err := dependencies.CredentialStore.Load(profileName)
+	if errors.Is(err, credentials.ErrCredentialNotFound) {
+		fmt.Fprintf(stderr, "error: profile %q is not logged in\n", profileName)
+		return 1
+	}
+	if err != nil {
+		printCredentialError(stderr, fmt.Sprintf("load %q credential", profileName), err)
+		return 1
+	}
+	if strings.TrimSpace(sessionKey) == "" {
+		fmt.Fprintf(stderr, "error: stored %q credential is empty\n", profileName)
+		return 1
+	}
+	if strings.TrimSpace(profile.LastFMUsername) == "" {
+		fmt.Fprintf(stderr, "error: profile %q has no Last.fm username; log in again\n", profileName)
+		return 1
+	}
+
+	location := time.Local
+	from, err := parseAnalysisDate(options.from, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	to, err := parseAnalysisDate(options.to, location)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 2
+	}
+	paths := append([]string(nil), command...)
+	if from.IsZero() || to.IsZero() {
+		discoveredFrom, discoveredTo, discoverErr := discoverAnalysisBounds(paths, location)
+		if discoverErr != nil {
+			fmt.Fprintf(stderr, "error: %v\n", discoverErr)
+			return 1
+		}
+		if from.IsZero() {
+			from = discoveredFrom
+		}
+		if to.IsZero() {
+			to = discoveredTo
+		}
+	}
+
+	var ingestionSummary spotify.Summary
+	exclusionCounts := make(map[string]int)
+	summary, err := lastfm.Compare(
+		context.Background(),
+		dependencies.LastFMClient,
+		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
+		lastfm.ComparisonRequest{
+			From:                  from,
+			To:                    to,
+			Timezone:              location,
+			TimestampTolerance:    options.timestampTolerance,
+			TimestampToleranceSet: options.timestampToleranceSet,
+			Plays: func(ctx context.Context, consume spotify.Consumer) error {
+				var ingestErr error
+				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
+					exclusionCounts[warning.Code]++
+				})
+				return ingestErr
+			},
+		},
+		func(lastfm.ComparisonResult) error { return nil },
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: analyse: %v\n", err)
+		return 1
+	}
+
+	fmt.Fprintf(stdout, "Analysis summary for profile %q\n", profileName)
+	fmt.Fprintf(stdout, "Total Spotify plays: %d\n", ingestionSummary.Records)
+	fmt.Fprintf(stdout, "In-scope Last.fm scrobbles: %d\n", summary.LastFMScrobbles)
+	fmt.Fprintf(stdout, "Estimated missing plays: %d\n", summary.Missing)
+	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", from.In(location).Format("2006-01-02"), to.In(location).Format("2006-01-02"))
+	fmt.Fprintf(stdout, "Timestamp tolerance: %s\n", summary.TimestampTolerance)
+	fmt.Fprintf(stdout, "Confidence: high=%d medium=%d low=%d\n", summary.HighConfidence, summary.MediumConfidence, summary.LowConfidence)
+	for reason, count := range summary.ExcludedByReason {
+		exclusionCounts[reason] += count
+	}
+	fmt.Fprintln(stdout, "Source exclusion reasons:")
+	reasons := make([]string, 0, len(exclusionCounts))
+	for reason := range exclusionCounts {
+		reasons = append(reasons, reason)
+	}
+	sort.Strings(reasons)
+	for _, reason := range reasons {
+		fmt.Fprintf(stdout, "  %s: %d\n", reason, exclusionCounts[reason])
+	}
+	return 0
+}
+
+func parseAnalysisDate(value string, location *time.Location) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	date, err := time.ParseInLocation("2006-01-02", value, location)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("analysis date %q must use YYYY-MM-DD", value)
+	}
+	return date, nil
+}
+
+func discoverAnalysisBounds(paths []string, location *time.Location) (time.Time, time.Time, error) {
+	var first, last time.Time
+	_, err := spotify.IngestFiles(context.Background(), paths, func(play spotify.Play) error {
+		local := play.Timestamp.In(location)
+		day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+		if first.IsZero() || day.Before(first) {
+			first = day
+		}
+		if last.IsZero() || day.After(last) {
+			last = day
+		}
+		return nil
+	}, nil)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("read Spotify exports: %w", err)
+	}
+	if first.IsZero() || last.IsZero() {
+		return time.Time{}, time.Time{}, errors.New("cannot determine analysis date range from Spotify exports; pass --from and --to")
+	}
+	return first, last, nil
+}
+
 func printCredentialError(stderr io.Writer, action string, err error) {
 	if errors.Is(err, credentials.ErrSecureStoreUnavailable) {
 		fmt.Fprintf(stderr, "error: %s: %v; %s\n", action, credentials.ErrSecureStoreUnavailable, secureStoreGuidance)
@@ -394,6 +617,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] login")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] logout")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Global options:")

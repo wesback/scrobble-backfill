@@ -76,16 +76,17 @@ type ComparisonResult struct {
 // ComparisonSummary contains counts from a streaming comparison. It does not
 // retain either the Spotify source or Last.fm history.
 type ComparisonSummary struct {
-	FromUTC            time.Time     `json:"from_utc"`
-	ToUTC              time.Time     `json:"to_utc"`
-	TimestampTolerance time.Duration `json:"timestamp_tolerance"`
-	Eligible           int           `json:"eligible"`
-	Matched            int           `json:"matched"`
-	Missing            int           `json:"missing"`
-	LastFMScrobbles    int           `json:"lastfm_scrobbles"`
-	HighConfidence     int           `json:"high_confidence"`
-	MediumConfidence   int           `json:"medium_confidence"`
-	LowConfidence      int           `json:"low_confidence"`
+	FromUTC            time.Time      `json:"from_utc"`
+	ToUTC              time.Time      `json:"to_utc"`
+	TimestampTolerance time.Duration  `json:"timestamp_tolerance"`
+	Eligible           int            `json:"eligible"`
+	Matched            int            `json:"matched"`
+	Missing            int            `json:"missing"`
+	LastFMScrobbles    int            `json:"lastfm_scrobbles"`
+	HighConfidence     int            `json:"high_confidence"`
+	MediumConfidence   int            `json:"medium_confidence"`
+	LowConfidence      int            `json:"low_confidence"`
+	ExcludedByReason   map[string]int `json:"excluded_by_reason,omitempty"`
 }
 
 // Compare streams normalized Spotify plays against the profile's bounded
@@ -131,6 +132,7 @@ func Compare(
 		FromUTC:            start,
 		ToUTC:              end,
 		TimestampTolerance: tolerance,
+		ExcludedByReason:   make(map[string]int),
 	}
 	evaluator := NewEligibilityEvaluator(client, profile)
 	groupsByKey := make(map[string]*comparisonGroup)
@@ -177,6 +179,7 @@ func Compare(
 			return err
 		}
 		if !decision.Eligible {
+			summary.ExcludedByReason[string(decision.Reason)]++
 			return nil
 		}
 		summary.Eligible++
