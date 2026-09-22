@@ -58,7 +58,15 @@ On PowerShell, compare the output of
 `(Get-FileHash .\rescrobble-windows-amd64.exe -Algorithm SHA256).Hash.ToLower()`
 with the Windows entry in `SHA256SUMS`. Do not run a binary when its digest
 does not match. See [docs/releases.md](docs/releases.md) for the fallback
-command on systems without `--ignore-missing`.
+command on systems without `--ignore-missing`. If GitHub CLI is installed,
+also verify the signed build provenance:
+
+```sh
+gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill
+```
+
+Use the matching asset path for Windows or Linux. Do not run a binary if
+either verification fails.
 
 The binary names and publishing process are maintained in
 [docs/releases.md](docs/releases.md). There is currently no supported

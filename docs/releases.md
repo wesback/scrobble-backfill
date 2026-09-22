@@ -55,6 +55,19 @@ Compare that value with the Windows entry in `SHA256SUMS`. Do not run a
 binary if its digest does not match the manifest; download the release again
 or report the mismatch.
 
+For stronger provenance verification, install a current GitHub CLI and run
+`gh attestation verify` against the downloaded asset:
+
+```sh
+gh attestation verify ./rescrobble-darwin-amd64 \
+  --repo wesback/scrobble-backfill
+```
+
+Use the matching Windows or Linux asset path as needed. The command verifies
+that GitHub's signed build provenance covers the exact downloaded file and
+was produced for this repository. Do not run the binary if attestation
+verification fails.
+
 ## Publishing
 
 Maintainers publish a release by pushing a version tag such as `v1.0.0`.
