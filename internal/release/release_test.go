@@ -13,6 +13,9 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 		"goos: windows",
 		"goos: darwin",
 		"goos: linux",
+		"runner: windows-2022",
+		"runner: macos-13",
+		"runner: ubuntu-24.04",
 	} {
 		if !strings.Contains(workflow, target) {
 			t.Errorf("release workflow does not define %q", target)
@@ -31,11 +34,59 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
       - "v*"`) {
 		t.Error("release workflow is not triggered by version tags")
 	}
+	if strings.Contains(workflow, "\npermissions:\n  contents: write") {
+		t.Error("release workflow grants contents write permission to every job")
+	}
+	for _, permission := range []string{
+		"contents: write",
+		"id-token: write",
+		"attestations: write",
+	} {
+		if !strings.Contains(workflow, permission) {
+			t.Errorf("release workflow does not grant %q", permission)
+		}
+	}
+	for _, command := range []string{
+		"--help",
+		"--version",
+		`actual_version="$(./"${{ matrix.binary }}" --version)"`,
+		`[[ "${actual_version}" != "${VERSION}" ]]`,
+	} {
+		if !strings.Contains(workflow, command) {
+			t.Errorf("release workflow does not validate %q", command)
+		}
+	}
+	if strings.Count(workflow, "binary: ") != 3 {
+		t.Errorf("release workflow defines %d binaries, want exactly 3", strings.Count(workflow, "binary: "))
+	}
+	if !strings.Contains(workflow, "uses: actions/attest-build-provenance@v2") ||
+		!strings.Contains(workflow, "subject-path: ${{ matrix.binary }}") {
+		t.Error("release workflow does not attest each built binary")
+	}
 	if !strings.Contains(workflow, `uses: softprops/action-gh-release@v2`) {
 		t.Error("release workflow does not upload to a GitHub Release")
 	}
-	if !strings.Contains(workflow, "files: release-assets/*") {
-		t.Error("release workflow does not upload the target binary")
+	for _, asset := range []string{
+		"release-assets/rescrobble-windows-amd64.exe",
+		"release-assets/rescrobble-darwin-amd64",
+		"release-assets/rescrobble-linux-amd64",
+		"release-assets/SHA256SUMS",
+	} {
+		if !strings.Contains(workflow, asset) {
+			t.Errorf("release workflow does not publish %q", asset)
+		}
+	}
+	if strings.Contains(workflow, "files: release-assets/*") {
+		t.Error("release workflow publishes an uncontrolled asset glob")
+	}
+	for _, required := range []string{
+		`sha256sum "${binaries[@]}" > SHA256SUMS`,
+		"generate_release_notes: true",
+		"fail_on_unmatched_files: true",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("release workflow does not contain %q", required)
+		}
 	}
 	if !strings.Contains(workflow, "VERSION: ${{ github.ref_name }}") ||
 		!strings.Contains(workflow, `-X main.version=${VERSION}`) {
@@ -50,22 +101,29 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 }
 
 func TestReleaseDocumentationDefinesGitHubOnlyMVPDistribution(t *testing.T) {
-	documentation := readRepositoryFile(t, "docs/releases.md")
+	for _, path := range []string{"README.md", "docs/releases.md"} {
+		documentation := readRepositoryFile(t, path)
 
-	for _, required := range []string{
-		"GitHub Releases",
-		"Homebrew",
-		"Scoop",
-		"Docker",
-		"rescrobble-windows-amd64.exe",
-		"rescrobble-darwin-amd64",
-		"rescrobble-linux-amd64",
-		`.\rescrobble-windows-amd64.exe --help`,
-		"./rescrobble-darwin-amd64 --help",
-		"./rescrobble-linux-amd64 --help",
-	} {
-		if !strings.Contains(documentation, required) {
-			t.Errorf("release documentation does not contain %q", required)
+		for _, required := range []string{
+			"GitHub Releases",
+			"Homebrew",
+			"Scoop",
+			"Docker",
+			"rescrobble-windows-amd64.exe",
+			"rescrobble-darwin-amd64",
+			"rescrobble-linux-amd64",
+			`.\rescrobble-windows-amd64.exe --help`,
+			"./rescrobble-darwin-amd64 --help",
+			"./rescrobble-linux-amd64 --help",
+			"SHA256SUMS",
+			"sha256sum --ignore-missing -c SHA256SUMS",
+			"gh attestation verify ./rescrobble-windows-amd64.exe --repo wesback/scrobble-backfill",
+			"gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill",
+			"gh attestation verify ./rescrobble-linux-amd64 --repo wesback/scrobble-backfill",
+		} {
+			if !strings.Contains(documentation, required) {
+				t.Errorf("%s does not contain %q", path, required)
+			}
 		}
 	}
 }

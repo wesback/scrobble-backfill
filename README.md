@@ -47,6 +47,28 @@ chmod +x rescrobble-darwin-amd64   # use rescrobble-linux-amd64 on Linux
 ./rescrobble-darwin-amd64 --help   # use rescrobble-linux-amd64 on Linux
 ```
 
+Before executing a downloaded binary, download the release's `SHA256SUMS`
+file into the same directory and verify the matching asset:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
+On PowerShell, compare the output of
+`(Get-FileHash .\rescrobble-windows-amd64.exe -Algorithm SHA256).Hash.ToLower()`
+with the Windows entry in `SHA256SUMS`. Do not run a binary when its digest
+does not match. Also verify the signed build provenance with GitHub CLI:
+
+```sh
+gh attestation verify ./rescrobble-windows-amd64.exe --repo wesback/scrobble-backfill
+gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill
+gh attestation verify ./rescrobble-linux-amd64 --repo wesback/scrobble-backfill
+```
+
+Use the command matching the downloaded asset and do not run it if attestation
+verification fails. See [docs/releases.md](docs/releases.md) for fallback
+checksum commands on systems without `--ignore-missing`.
+
 The binary names and publishing process are maintained in
 [docs/releases.md](docs/releases.md). There is currently no supported
 Homebrew formula, Scoop package, Docker image, or other package-manager
