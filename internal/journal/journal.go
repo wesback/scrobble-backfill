@@ -141,17 +141,24 @@ type ReadOnlyStore interface {
 	CheckReadable(profile string) error
 }
 
+type profileLock interface {
+	Close() error
+}
+
+type profileLockAdapter func(string) (profileLock, error)
+
 // FileStore persists each profile's runs in a separate JSON file below Root.
 // Files are named from a hex encoding of the profile, so valid profile names
 // cannot escape Root or collide through path separators.
 type FileStore struct {
-	Root string
-	mu   sync.Mutex
+	Root        string
+	mu          sync.Mutex
+	lockAdapter profileLockAdapter
 }
 
 // NewFileStore creates a journal store rooted at path.
 func NewFileStore(path string) *FileStore {
-	return &FileStore{Root: path}
+	return &FileStore{Root: path, lockAdapter: acquireProfileFileLock}
 }
 
 // NewStore is the concise constructor for a file-backed journal.
@@ -635,11 +642,15 @@ func (s *FileStore) pathFor(profile string) string {
 	return filepath.Join(s.Root, hex.EncodeToString([]byte(profile))+".json")
 }
 
-func (s *FileStore) acquireProfileLock(profile string) (*profileLock, error) {
+func (s *FileStore) acquireProfileLock(profile string) (profileLock, error) {
 	if err := os.MkdirAll(s.Root, 0o700); err != nil {
 		return nil, fmt.Errorf("create journal directory %q: %w", s.Root, err)
 	}
-	lock, err := acquireProfileFileLock(filepath.Join(s.Root, hex.EncodeToString([]byte(profile))+".lock"))
+	adapter := s.lockAdapter
+	if adapter == nil {
+		adapter = acquireProfileFileLock
+	}
+	lock, err := adapter(filepath.Join(s.Root, hex.EncodeToString([]byte(profile))+".lock"))
 	if err != nil {
 		return nil, fmt.Errorf("lock journal for profile %q: %w", profile, err)
 	}

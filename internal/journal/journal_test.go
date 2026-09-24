@@ -19,25 +19,32 @@ func testSubmission(track string) Submission {
 	}
 }
 
+func newJournalStoreWithLockAdapter(root string) *FileStore {
+	return &FileStore{
+		Root:        root,
+		lockAdapter: profileLockAdapter(acquireProfileFileLock),
+	}
+}
+
 func TestJournalPersistsRunsAndResumesAfterAnInterruptedBatch(t *testing.T) {
 	root := t.TempDir()
-	store := NewFileStore(filepath.Join(root, "journal"))
-	if _, err := store.CreateRun("personal", "invocation-1"); err != nil {
+	journalRoot := filepath.Join(root, "journal")
+	if _, err := newJournalStoreWithLockAdapter(journalRoot).CreateRun("personal", "invocation-1"); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	if _, err := store.PlanBatches("personal", "invocation-1", [][]Submission{
+	if _, err := newJournalStoreWithLockAdapter(journalRoot).PlanBatches("personal", "invocation-1", [][]Submission{
 		{testSubmission("first")},
 		{testSubmission("second")},
 	}); err != nil {
 		t.Fatalf("plan batches: %v", err)
 	}
-	if err := store.MarkSubmitted("personal", "invocation-1", 1); err != nil {
+	if err := newJournalStoreWithLockAdapter(journalRoot).MarkSubmitted("personal", "invocation-1", 1); err != nil {
 		t.Fatalf("mark first batch submitted: %v", err)
 	}
 
 	// A new store models a process restart. Only the successful first batch is
 	// excluded; the interrupted second batch remains resumable.
-	restarted := NewFileStore(filepath.Join(root, "journal"))
+	restarted := newJournalStoreWithLockAdapter(journalRoot)
 	resume, err := restarted.Resume("personal", "invocation-1")
 	if err != nil {
 		t.Fatalf("resume run: %v", err)
@@ -53,6 +60,105 @@ func TestJournalPersistsRunsAndResumesAfterAnInterruptedBatch(t *testing.T) {
 	}
 	if got := resume.Pending[0].Payloads[0].Track; got != "second" {
 		t.Fatalf("resumable payload track = %q, want second", got)
+	}
+}
+
+func TestProfileLockAdapterSerializesAcquisitions(t *testing.T) {
+	adapter := profileLockAdapter(acquireProfileFileLock)
+	path := filepath.Join(t.TempDir(), "profile.lock")
+	first, err := adapter(path)
+	if err != nil {
+		t.Fatalf("acquire first lock: %v", err)
+	}
+	defer func() {
+		if first != nil {
+			_ = first.Close()
+		}
+	}()
+
+	type acquisition struct {
+		lock profileLock
+		err  error
+	}
+	secondResult := make(chan acquisition, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		lock, err := adapter(path)
+		secondResult <- acquisition{lock: lock, err: err}
+	}()
+	<-started
+
+	select {
+	case second := <-secondResult:
+		if second.lock != nil {
+			_ = second.lock.Close()
+		}
+		t.Fatal("second lock acquisition proceeded while the first lock was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("release first lock: %v", err)
+	}
+	first = nil
+
+	select {
+	case second := <-secondResult:
+		if second.err != nil {
+			t.Fatalf("acquire second lock after release: %v", second.err)
+		}
+		if err := second.lock.Close(); err != nil {
+			t.Fatalf("release second lock: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second lock acquisition did not proceed after release")
+	}
+}
+
+func TestFileStoreLockAdapterSupportsOperationsAcrossInstances(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "journal")
+	if _, err := newJournalStoreWithLockAdapter(root).CreateRun("personal", "invocation-1"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := newJournalStoreWithLockAdapter(root).PlanBatch("personal", "invocation-1", []Submission{testSubmission("track")}); err != nil {
+		t.Fatalf("plan batch: %v", err)
+	}
+	if err := newJournalStoreWithLockAdapter(root).MarkSubmitted("personal", "invocation-1", 1); err != nil {
+		t.Fatalf("mark batch submitted: %v", err)
+	}
+
+	run, err := newJournalStoreWithLockAdapter(root).OpenRun("personal", "invocation-1")
+	if err != nil {
+		t.Fatalf("open run: %v", err)
+	}
+	if len(run.Batches) != 1 || run.Batches[0].State != StateSubmitted {
+		t.Fatalf("reopened batches = %#v, want one submitted batch", run.Batches)
+	}
+}
+
+func TestJournalReleasesLockAfterOperationError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "journal")
+	store := newJournalStoreWithLockAdapter(root)
+	if _, err := store.CreateRun("personal", "invocation-1"); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := store.MarkSubmitted("personal", "invocation-1", 1); !errors.Is(err, ErrBatchNotFound) {
+		t.Fatalf("mark missing batch error = %v, want ErrBatchNotFound", err)
+	}
+
+	reopened := make(chan error, 1)
+	go func() {
+		_, err := newJournalStoreWithLockAdapter(root).OpenRun("personal", "invocation-1")
+		reopened <- err
+	}()
+	select {
+	case err := <-reopened:
+		if err != nil {
+			t.Fatalf("open run after failed operation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("journal lock was not released after the operation returned an error")
 	}
 }
 
