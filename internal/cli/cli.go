@@ -823,6 +823,7 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 
 	var ingestionSummary spotify.Summary
 	exclusionCounts := make(map[string]int)
+	progress := observability.NewProgress(stdout)
 	summary, err := lastfm.Compare(
 		context.Background(),
 		dependencies.LastFMClient,
@@ -834,11 +835,25 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 			TimestampTolerance:    timestampTolerance,
 			TimestampToleranceSet: timestampToleranceSet,
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
+				deliveredRecords := 0
+				progressingConsume := func(play spotify.Play) error {
+					if err := consume(play); err != nil {
+						return err
+					}
+					deliveredRecords++
+					if deliveredRecords%1000 == 0 {
+						return progress.Update(deliveredRecords, 0, "records ingested")
+					}
+					return nil
+				}
 				var ingestErr error
-				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
+				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, progressingConsume, func(warning spotify.Warning) {
 					exclusionCounts[warning.Code]++
 				})
-				return ingestErr
+				if ingestErr != nil {
+					return ingestErr
+				}
+				return progress.Complete(fmt.Sprintf("progress complete: %d records ingested", deliveredRecords))
 			},
 		},
 		func(lastfm.ComparisonResult) error { return nil },
