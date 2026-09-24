@@ -16,7 +16,7 @@ const (
 	// credential store.
 	ServiceName = "rescrobble/lastfm"
 
-	unavailableStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service)"
+	unavailableStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service); on Linux, the encrypted local fallback is selected only when Secret Service is unavailable and provides weaker protection"
 )
 
 var (
@@ -42,6 +42,23 @@ type Store interface {
 // CredentialStore is an explicit name for Store for callers that prefer the
 // domain terminology.
 type CredentialStore = Store
+
+// Tier identifies the credential backend selected for a credential operation.
+type Tier string
+
+const (
+	// TierNative is the host operating system's native credential service.
+	TierNative Tier = "native OS credential store"
+	// TierLinuxEncryptedFallback is the machine-bound encrypted Linux file store.
+	TierLinuxEncryptedFallback Tier = "Linux encrypted local fallback"
+)
+
+// TieredStore can report which backend a credential read selected.
+type TieredStore interface {
+	// LoadWithTier returns the credential, selected tier, native-store error,
+	// and selected-tier read error, in that order.
+	LoadWithTier(profile string) (string, Tier, error, error)
+}
 
 // OSStore stores sessions in the operating system's native credential
 // service. The underlying library selects Windows Credential Manager, macOS
@@ -180,14 +197,26 @@ func (s *linuxFallbackStore) Save(profile, session string) error {
 }
 
 func (s *linuxFallbackStore) Load(profile string) (string, error) {
+	session, _, _, err := s.LoadWithTier(profile)
+	return session, err
+}
+
+// LoadWithTier reports the backend selected by the same native-first read
+// policy used to load the credential. Missing credentials still identify the
+// tier because ErrCredentialNotFound is not a native-store availability error.
+func (s *linuxFallbackStore) LoadWithTier(profile string) (string, Tier, error, error) {
 	if s == nil || s.native == nil {
-		return "", ErrSecureStoreUnavailable
+		return "", "", ErrSecureStoreUnavailable, ErrSecureStoreUnavailable
 	}
 	session, err := s.native.Load(profile)
 	if !errors.Is(err, ErrSecureStoreUnavailable) {
-		return session, err
+		return session, TierNative, err, err
 	}
-	return s.fallback.Load(profile)
+	if s.fallback == nil {
+		return "", "", err, err
+	}
+	session, fallbackErr := s.fallback.Load(profile)
+	return session, TierLinuxEncryptedFallback, err, fallbackErr
 }
 
 func (s *linuxFallbackStore) Has(profile string) (bool, error) {

@@ -268,6 +268,28 @@ func (s *policyStore) Has(profile string) (bool, error) {
 	return ok, nil
 }
 
+func TestLinuxLoadWithTierDoesNotReportMissingFallbackAsSelected(t *testing.T) {
+	native := &policyStore{loadErr: ErrSecureStoreUnavailable}
+	store := &linuxFallbackStore{native: native}
+
+	session, tier, nativeErr, err := store.LoadWithTier("personal")
+	if session != "" {
+		t.Fatalf("session = %q, want empty", session)
+	}
+	if tier != "" {
+		t.Fatalf("tier = %q, want undetermined tier", tier)
+	}
+	if !errors.Is(nativeErr, ErrSecureStoreUnavailable) {
+		t.Fatalf("native store error = %v, want ErrSecureStoreUnavailable", nativeErr)
+	}
+	if !errors.Is(err, ErrSecureStoreUnavailable) {
+		t.Fatalf("load error = %v, want ErrSecureStoreUnavailable", err)
+	}
+	if got := native.calls["load"]; got != 1 {
+		t.Fatalf("native Load calls = %d, want 1", got)
+	}
+}
+
 func TestLinuxFallbackConsultedOnlyWhenNativeUnavailable(t *testing.T) {
 	t.Run("save", func(t *testing.T) {
 		otherErr := errors.New("write failed")

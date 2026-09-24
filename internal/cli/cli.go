@@ -64,7 +64,7 @@ type Dependencies struct {
 	Input           io.Reader
 }
 
-const secureStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service)"
+const secureStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service); on Linux, the encrypted local fallback is selected only when Secret Service is unavailable and provides weaker protection"
 
 // LargeImportConfirmationThreshold is the largest missing-play count that
 // imports submit without an interactive confirmation. Larger imports require
@@ -491,6 +491,7 @@ func runDoctor(options options, stdout, stderr io.Writer, dependencies Dependenc
 	if configErr != nil {
 		printDoctorDependentFailures(stdout, "profile selection", "configuration is unreadable")
 		printDoctorDependentFailures(stdout, "secure keyring availability", "configuration is unreadable")
+		printDoctorDependentFailures(stdout, "credential storage tier", "configuration is unreadable")
 		printDoctorDependentFailures(stdout, "credential presence and validity", "configuration is unreadable")
 		printDoctorDependentFailures(stdout, "Last.fm API reachability and authentication", "configuration is unreadable")
 		printDoctorDependentFailures(stdout, "journal readability", "configuration is unreadable")
@@ -501,6 +502,7 @@ func runDoctor(options options, stdout, stderr io.Writer, dependencies Dependenc
 	if err != nil {
 		printDoctorDependentFailures(stdout, "profile selection", err.Error())
 		printDoctorDependentFailures(stdout, "secure keyring availability", "no profile was selected")
+		printDoctorDependentFailures(stdout, "credential storage tier", "no profile was selected")
 		printDoctorDependentFailures(stdout, "credential presence and validity", "no profile was selected")
 		printDoctorDependentFailures(stdout, "Last.fm API reachability and authentication", "no profile was selected")
 		printDoctorDependentFailures(stdout, "journal readability", "no profile was selected")
@@ -508,8 +510,10 @@ func runDoctor(options options, stdout, stderr io.Writer, dependencies Dependenc
 	}
 	fmt.Fprintf(stdout, "Profile: %q\n", profileName)
 
-	sessionKey, credentialErr := loadDoctorCredential(dependencies.CredentialStore, profileName)
-	keyringErr := doctorKeyringError(credentialErr)
+	sessionKey, tier, nativeStoreErr, credentialErr := loadDoctorCredential(dependencies.CredentialStore, profileName)
+	tierName, tierErr := doctorTierName(tier)
+	printDoctorResult(stdout, doctorResult{name: tierName, err: tierErr})
+	keyringErr := doctorKeyringError(nativeStoreErr)
 	printDoctorResult(stdout, doctorResult{name: "secure keyring availability", err: keyringErr})
 
 	profile := cfg.Profiles[profileName]
@@ -528,7 +532,7 @@ func runDoctor(options options, stdout, stderr io.Writer, dependencies Dependenc
 	journalErr := checkDoctorJournal(dependencies.JournalStore, profileName)
 	printDoctorResult(stdout, doctorResult{name: "journal readability", err: journalErr})
 
-	if keyringErr != nil || credentialErr != nil || apiErr != nil || journalErr != nil {
+	if keyringErr != nil || tierErr != nil || credentialErr != nil || apiErr != nil || journalErr != nil {
 		return 1
 	}
 	return 0
@@ -545,18 +549,39 @@ func loadDoctorConfig(store config.Store) (config.Config, error) {
 	return cfg, nil
 }
 
-func loadDoctorCredential(store credentials.Store, profile string) (string, error) {
+func loadDoctorCredential(store credentials.Store, profile string) (string, credentials.Tier, error, error) {
 	if store == nil {
-		return "", credentials.ErrSecureStoreUnavailable
+		return "", "", credentials.ErrSecureStoreUnavailable, credentials.ErrSecureStoreUnavailable
+	}
+	if tiered, ok := store.(credentials.TieredStore); ok {
+		session, tier, nativeErr, err := tiered.LoadWithTier(profile)
+		if err != nil {
+			return "", tier, nativeErr, err
+		}
+		if strings.TrimSpace(session) == "" {
+			return "", tier, nativeErr, errDoctorCredentialEmpty
+		}
+		return session, tier, nativeErr, nil
 	}
 	session, err := store.Load(profile)
 	if err != nil {
-		return "", err
+		return "", credentials.TierNative, err, err
 	}
 	if strings.TrimSpace(session) == "" {
-		return "", errDoctorCredentialEmpty
+		return "", credentials.TierNative, nil, errDoctorCredentialEmpty
 	}
-	return session, nil
+	return session, credentials.TierNative, nil, nil
+}
+
+func doctorTierName(tier credentials.Tier) (string, error) {
+	switch tier {
+	case credentials.TierNative:
+		return "credential storage tier: native OS credential store", nil
+	case credentials.TierLinuxEncryptedFallback:
+		return "credential storage tier: Linux encrypted local fallback (weaker than a native keyring; a user with access to the same host account or root can derive its key)", nil
+	default:
+		return "credential storage tier", errors.New("selected credential tier could not be determined")
+	}
 }
 
 func doctorKeyringError(err error) error {
@@ -1514,6 +1539,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] report (--json|--csv|--html) [<invocation-id>]")
+	fmt.Fprintln(w, "  Native credential storage is preferred. Linux uses an encrypted local fallback only when Secret Service is unavailable.")
+	fmt.Fprintln(w, "  The Linux fallback is machine-bound, not portable, and weaker: same-account users or root can derive its key.")
+	fmt.Fprintln(w, "  Store changes do not migrate credentials; login saves to the currently selected tier.")
+	fmt.Fprintln(w, "  Log in again to establish a credential in a different tier.")
+	fmt.Fprintln(w, "  After machine-identity loss, log in again. Logout clears credentials from both Linux tiers.")
 	fmt.Fprintf(w, "  import confirms interactively when more than %d missing plays would be submitted; --yes bypasses confirmation.\n", LargeImportConfirmationThreshold)
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] profile use <name>")
 	fmt.Fprintln(w)
