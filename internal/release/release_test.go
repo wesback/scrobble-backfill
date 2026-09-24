@@ -155,6 +155,23 @@ func TestReleaseDocumentationDefinesGitHubOnlyMVPDistribution(t *testing.T) {
 	}
 }
 
+func TestReleaseDocumentationUsesValidatedTagHelper(t *testing.T) {
+	documentation := readRepositoryFile(t, "docs/releases.md")
+
+	for _, required := range []string{
+		"scripts/tag-release.sh v1.0.0",
+		"clean, up-to-date `main` checkout",
+		"Do not use `git push --tags`",
+	} {
+		if !strings.Contains(documentation, required) {
+			t.Errorf("release documentation does not contain %q", required)
+		}
+	}
+	if strings.Contains(documentation, "by pushing a version tag") {
+		t.Error("release documentation still directs maintainers to push a version tag manually")
+	}
+}
+
 func TestMITLicenseIsIncluded(t *testing.T) {
 	license := readRepositoryFile(t, "LICENSE")
 	for _, required := range []string{
