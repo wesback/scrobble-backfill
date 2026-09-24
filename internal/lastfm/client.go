@@ -47,15 +47,20 @@ func (e *APIError) Error() string {
 }
 
 // HTTPError describes an unsuccessful HTTP response without retaining its
-// body. Keeping the response body out of the error prevents remote content
-// from accidentally echoing credentials or other request data.
+// body. A valid Last.fm API error envelope may be included as safe diagnostic
+// details.
 type HTTPError struct {
 	StatusCode int
 	Status     string
+	APIError   *APIError
 }
 
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("Last.fm returned HTTP %s", e.Status)
+	message := fmt.Sprintf("Last.fm returned HTTP %s", e.Status)
+	if e.APIError != nil {
+		message += ": " + e.APIError.Error()
+	}
+	return message
 }
 
 // Client is a Last.fm API client. API credentials are supplied by the
@@ -251,7 +256,18 @@ func (c *Client) callJSON(ctx context.Context, method string, params map[string]
 		return nil, fmt.Errorf("read Last.fm response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return nil, &HTTPError{StatusCode: response.StatusCode, Status: response.Status}
+		httpErr := &HTTPError{StatusCode: response.StatusCode, Status: response.Status}
+		var envelope struct {
+			Code    *int    `json:"error"`
+			Message *string `json:"message"`
+		}
+		if json.Unmarshal(body, &envelope) == nil && envelope.Code != nil && envelope.Message != nil {
+			httpErr.APIError = &APIError{
+				Code:    *envelope.Code,
+				Message: redactCredentials(*envelope.Message, c.APIKey, c.APISecret, sessionKey, values["api_sig"]),
+			}
+		}
+		return nil, httpErr
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -259,9 +275,41 @@ func (c *Client) callJSON(ctx context.Context, method string, params map[string]
 	}
 	if code, ok := payload["error"].(float64); ok {
 		message, _ := payload["message"].(string)
-		return nil, &APIError{Code: int(code), Message: message}
+		return nil, &APIError{
+			Code:    int(code),
+			Message: redactCredentials(message, c.APIKey, c.APISecret, sessionKey, values["api_sig"]),
+		}
 	}
 	return payload, nil
+}
+
+func redactCredentials(message string, credentials ...string) string {
+	secrets := make([]string, 0, len(credentials))
+	for _, credential := range credentials {
+		if credential != "" {
+			secrets = append(secrets, credential)
+		}
+	}
+	sort.Slice(secrets, func(i, j int) bool {
+		if len(secrets[i]) == len(secrets[j]) {
+			return secrets[i] < secrets[j]
+		}
+		return len(secrets[i]) > len(secrets[j])
+	})
+	replacements := make([]string, 0, len(secrets)*2)
+	for _, secret := range secrets {
+		replacements = append(replacements, secret, "[redacted]")
+	}
+	if len(replacements) == 0 {
+		return message
+	}
+	message = strings.NewReplacer(replacements...).Replace(message)
+	for _, secret := range secrets {
+		if strings.Contains(message, secret) {
+			return ""
+		}
+	}
+	return message
 }
 
 func (c *Client) validate() error {
