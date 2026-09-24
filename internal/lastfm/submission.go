@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,8 +29,9 @@ const (
 )
 
 var (
-	errSubmissionClientUnavailable  = errors.New("Last.fm submission client is unavailable")
-	errSubmissionJournalUnavailable = errors.New("Last.fm submission journal is unavailable")
+	errSubmissionClientUnavailable          = errors.New("Last.fm submission client is unavailable")
+	errSubmissionJournalUnavailable         = errors.New("Last.fm submission journal is unavailable")
+	errSubmissionOutcomeRecorderUnavailable = errors.New("Last.fm submission journal does not support atomic outcome recording")
 )
 
 // SubmissionSleeper waits before a submission request. It is a function so
@@ -66,6 +69,17 @@ type SubmissionService struct {
 	options SubmissionOptions
 }
 
+type submissionResult struct {
+	accepted int
+	ignored  []ignoredSubmission
+}
+
+type ignoredSubmission struct {
+	index  int
+	code   string
+	reason string
+}
+
 // NewSubmissionService creates a service backed by client and store.
 func NewSubmissionService(client *Client, store journal.Store, options ...SubmissionOptions) *SubmissionService {
 	selected := SubmissionOptions{}
@@ -93,6 +107,9 @@ func (s *SubmissionService) Submit(
 	}
 	if s.journal == nil {
 		return errSubmissionJournalUnavailable
+	}
+	if _, ok := s.journal.(journal.EventBatchRecorder); !ok {
+		return errSubmissionOutcomeRecorderUnavailable
 	}
 	if strings.TrimSpace(profile.Username) == "" {
 		return errors.New("Last.fm submission profile username is empty")
@@ -136,6 +153,19 @@ func (s *SubmissionService) Submit(
 			if batch.State != journal.StatePlanned {
 				return fmt.Errorf("Last.fm submission journal batch %d has invalid state %q", batch.Sequence, batch.State)
 			}
+			if hasSubmissionResult(resume.Run, batch.Sequence) {
+				if err := s.journal.MarkSubmitted(run.Profile, run.InvocationID, batch.Sequence); err != nil {
+					return fmt.Errorf("mark recovered Last.fm submission batch %d submitted: %w", batch.Sequence, err)
+				}
+				completed++
+				if s.options.Progress != nil {
+					if err := s.options.Progress(completed, len(batches)); err != nil {
+						return fmt.Errorf("report Last.fm submission progress after batch %d: %w", batch.Sequence, err)
+					}
+				}
+				previousRequest = true
+				continue
+			}
 		} else {
 			batch, err = s.journal.PlanBatch(run.Profile, run.InvocationID, batches[index])
 			if err != nil {
@@ -148,8 +178,12 @@ func (s *SubmissionService) Submit(
 				return fmt.Errorf("wait before Last.fm submission batch %d: %w", batch.Sequence, err)
 			}
 		}
-		if err := s.dispatch(ctx, profile, batch); err != nil {
+		result, err := s.dispatch(ctx, profile, batch)
+		if err != nil {
 			return err
+		}
+		if err := s.recordSubmissionResult(run, batch, result, profile); err != nil {
+			return fmt.Errorf("record Last.fm submission batch %d outcome: %w", batch.Sequence, err)
 		}
 		if err := s.journal.MarkSubmitted(run.Profile, run.InvocationID, batch.Sequence); err != nil {
 			return fmt.Errorf("mark Last.fm submission batch %d submitted: %w", batch.Sequence, err)
@@ -265,20 +299,183 @@ func spotifySubmissionPayloads(plays []spotify.Play) ([]journal.Submission, erro
 	return payloads, nil
 }
 
-func (s *SubmissionService) dispatch(ctx context.Context, profile AuthenticatedProfile, batch journal.Batch) error {
+func (s *SubmissionService) dispatch(ctx context.Context, profile AuthenticatedProfile, batch journal.Batch) (submissionResult, error) {
 	for attempt := 0; ; attempt++ {
-		_, err := s.client.Call(ctx, "track.scrobble", submissionParams(batch.Payloads), profile.SessionKey)
+		response, err := s.client.Call(ctx, "track.scrobble", submissionParams(batch.Payloads), profile.SessionKey)
 		if err == nil {
-			return nil
+			result, parseErr := parseSubmissionResponse(response, len(batch.Payloads))
+			if parseErr != nil {
+				return submissionResult{}, fmt.Errorf("submit Last.fm batch %d: %w", batch.Sequence, parseErr)
+			}
+			return result, nil
 		}
 		if !retryableSubmissionError(err) || attempt >= s.options.MaxRetries {
-			return fmt.Errorf("submit Last.fm batch %d: %s", batch.Sequence, redactSession(err.Error(), profile.SessionKey))
+			return submissionResult{}, fmt.Errorf("submit Last.fm batch %d: %s", batch.Sequence, redactSession(err.Error(), profile.SessionKey))
 		}
 		delay := retryDelay(s.options.BaselineDelay, attempt)
 		if err := s.wait(ctx, delay); err != nil {
-			return fmt.Errorf("wait to retry Last.fm batch %d: %w", batch.Sequence, err)
+			return submissionResult{}, fmt.Errorf("wait to retry Last.fm batch %d: %w", batch.Sequence, err)
 		}
 	}
+}
+
+func (s *SubmissionService) recordSubmissionResult(
+	run journal.Run,
+	batch journal.Batch,
+	result submissionResult,
+	profile AuthenticatedProfile,
+) error {
+	events := make([]journal.Event, 0, len(result.ignored)+1)
+	events = append(events, journal.Event{
+		Type: "submission.batch.result",
+		Data: map[string]string{
+			"batch":    strconv.Itoa(batch.Sequence),
+			"accepted": strconv.Itoa(result.accepted),
+			"ignored":  strconv.Itoa(len(result.ignored)),
+			"count":    strconv.Itoa(len(batch.Payloads)),
+		},
+	})
+	for _, ignored := range result.ignored {
+		payload := batch.Payloads[ignored.index]
+		events = append(events, journal.Event{
+			Type: "submission.scrobble.ignored",
+			Data: map[string]string{
+				"batch":     strconv.Itoa(batch.Sequence),
+				"index":     strconv.Itoa(ignored.index + 1),
+				"code":      ignored.code,
+				"reason":    redactCredentials(ignored.reason, s.client.APIKey, s.client.APISecret, profile.SessionKey),
+				"artist":    payload.Artist,
+				"track":     payload.Track,
+				"timestamp": payload.Timestamp.UTC().Format(time.RFC3339Nano),
+			},
+		})
+	}
+	recorder := s.journal.(journal.EventBatchRecorder)
+	return recorder.RecordEvents(run.Profile, run.InvocationID, events)
+}
+
+func parseSubmissionResponse(response map[string]any, expected int) (submissionResult, error) {
+	envelope, ok := response["scrobbles"].(map[string]any)
+	if !ok {
+		return submissionResult{}, errors.New("Last.fm scrobble response is missing scrobbles")
+	}
+	attributes, ok := envelope["@attr"].(map[string]any)
+	if !ok {
+		return submissionResult{}, errors.New("Last.fm scrobble response is missing counts")
+	}
+	accepted, err := parseResponseCount(attributes["accepted"])
+	if err != nil {
+		return submissionResult{}, fmt.Errorf("Last.fm scrobble response has invalid accepted count: %w", err)
+	}
+	ignoredCount, err := parseResponseCount(attributes["ignored"])
+	if err != nil {
+		return submissionResult{}, fmt.Errorf("Last.fm scrobble response has invalid ignored count: %w", err)
+	}
+	if accepted > expected || ignoredCount != expected-accepted {
+		return submissionResult{}, fmt.Errorf(
+			"Last.fm scrobble response counts are inconsistent: accepted %d, ignored %d, submitted %d",
+			accepted, ignoredCount, expected,
+		)
+	}
+
+	var scrobbles []any
+	switch items := envelope["scrobble"].(type) {
+	case []any:
+		scrobbles = items
+	case map[string]any:
+		scrobbles = []any{items}
+	default:
+		return submissionResult{}, errors.New("Last.fm scrobble response is missing per-item details")
+	}
+	if len(scrobbles) != expected {
+		return submissionResult{}, fmt.Errorf(
+			"Last.fm scrobble response has %d per-item details for %d submitted plays",
+			len(scrobbles), expected,
+		)
+	}
+
+	result := submissionResult{accepted: accepted, ignored: make([]ignoredSubmission, 0, ignoredCount)}
+	for index, item := range scrobbles {
+		detail, ok := item.(map[string]any)
+		if !ok {
+			return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d is malformed", index+1)
+		}
+		message, ok := detail["ignoredMessage"].(map[string]any)
+		if !ok {
+			return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d is missing ignored details", index+1)
+		}
+		code, err := parseIgnoredCode(message["code"])
+		if err != nil {
+			return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d has an invalid ignored code", index+1)
+		}
+		text, ok := message["#text"].(string)
+		if !ok {
+			return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d has an invalid ignored reason", index+1)
+		}
+		if code != "0" {
+			reason := strings.TrimSpace(text)
+			if reason == "" {
+				return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d is ignored without a reason", index+1)
+			}
+			result.ignored = append(result.ignored, ignoredSubmission{index: index, code: code, reason: reason})
+		}
+	}
+	if len(result.ignored) != ignoredCount || accepted != expected-len(result.ignored) {
+		return submissionResult{}, fmt.Errorf(
+			"Last.fm scrobble response item details are inconsistent with accepted %d and ignored %d counts",
+			accepted, ignoredCount,
+		)
+	}
+	return result, nil
+}
+
+func parseIgnoredCode(value any) (string, error) {
+	switch value := value.(type) {
+	case string:
+		code := strings.TrimSpace(value)
+		if code == "" {
+			return "", errors.New("code is empty")
+		}
+		return code, nil
+	case float64:
+		code, err := parseResponseCount(value)
+		if err != nil {
+			return "", err
+		}
+		return strconv.Itoa(code), nil
+	default:
+		return "", errors.New("code must be a string or integer")
+	}
+}
+
+func parseResponseCount(value any) (int, error) {
+	var count int64
+	var err error
+	switch value := value.(type) {
+	case string:
+		count, err = strconv.ParseInt(value, 10, 0)
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || value >= float64(math.MaxInt) || math.Trunc(value) != value {
+			return 0, errors.New("count must be a non-negative integer")
+		}
+		count = int64(value)
+	default:
+		return 0, errors.New("count must be a string or integer")
+	}
+	if err != nil || count < 0 || int64(int(count)) != count {
+		return 0, errors.New("count must be a non-negative integer")
+	}
+	return int(count), nil
+}
+
+func hasSubmissionResult(run journal.Run, sequence int) bool {
+	want := strconv.Itoa(sequence)
+	for _, event := range run.Events {
+		if event.Type == "submission.batch.result" && event.Data["batch"] == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SubmissionService) wait(ctx context.Context, delay time.Duration) error {

@@ -115,6 +115,53 @@ func TestRenderFormatsIncludePortableOutcomesAndRedactCredentials(t *testing.T) 
 	}
 }
 
+func TestBuildReportsAPIAcceptedCountAndIgnoredReason(t *testing.T) {
+	started := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	run := journal.Run{
+		Profile: "personal", InvocationID: "import-partial",
+		Batches: []journal.Batch{{
+			Sequence: 1, State: journal.StateSubmitted,
+			Payloads: []journal.Submission{
+				{Artist: "Artist", Track: "Accepted", Timestamp: started},
+				{Artist: "Artist", Track: "Ignored", Timestamp: started.Add(time.Minute)},
+			},
+		}},
+		Events: []journal.Event{
+			{Type: "submission.batch.result", Data: map[string]string{
+				"batch": "1", "accepted": "1", "ignored": "1", "count": "2",
+			}},
+			{Type: "submission.batch.submitted", Data: map[string]string{
+				"batch": "1", "count": "2",
+			}},
+			{Type: "submission.scrobble.ignored", Data: map[string]string{
+				"batch": "1", "index": "2", "artist": "Artist", "track": "Ignored",
+				"code": "1", "reason": "Timestamp is too old",
+			}},
+		},
+	}
+	document := Build(run, Options{})
+	if document.Counts.ImportedScrobbles != 1 || document.Counts.IgnoredScrobbles != 1 {
+		t.Fatalf("counts = %#v, want one API-accepted and one ignored scrobble", document.Counts)
+	}
+	if len(document.Ignored) != 1 || document.Ignored[0].Track != "Ignored" ||
+		document.Ignored[0].Reason != "Timestamp is too old" {
+		t.Fatalf("ignored diagnostics = %#v, want track and Last.fm reason", document.Ignored)
+	}
+
+	output, err := Render(run, Options{Format: FormatJSON})
+	if err != nil {
+		t.Fatalf("render JSON report: %v", err)
+	}
+	var decoded Document
+	if err := json.Unmarshal(output, &decoded); err != nil {
+		t.Fatalf("decode JSON report: %v", err)
+	}
+	if decoded.Counts.ImportedScrobbles != 1 || decoded.Counts.IgnoredScrobbles != 1 ||
+		len(decoded.Ignored) != 1 || decoded.Ignored[0].Reason != "Timestamp is too old" {
+		t.Fatalf("decoded report = %#v, want accepted count and ignored reason", decoded)
+	}
+}
+
 func reportTimePtr(value time.Time) *time.Time {
 	return &value
 }

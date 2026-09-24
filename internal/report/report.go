@@ -53,6 +53,7 @@ type ExecutionTiming struct {
 
 type Counts struct {
 	ImportedScrobbles int            `json:"imported_scrobbles"`
+	IgnoredScrobbles  int            `json:"ignored_scrobbles"`
 	SkippedDuplicates int            `json:"skipped_duplicates"`
 	Failures          int            `json:"failures"`
 	Warnings          int            `json:"warnings"`
@@ -66,6 +67,8 @@ type Diagnostic struct {
 	Type    string `json:"type"`
 	Input   string `json:"input,omitempty"`
 	Record  string `json:"record,omitempty"`
+	Artist  string `json:"artist,omitempty"`
+	Track   string `json:"track,omitempty"`
 	Code    string `json:"code,omitempty"`
 	Reason  string `json:"reason,omitempty"`
 	Field   string `json:"field,omitempty"`
@@ -87,6 +90,7 @@ type Document struct {
 	Warnings           []Diagnostic    `json:"warnings,omitempty"`
 	MetadataIssues     []Diagnostic    `json:"metadata_issues,omitempty"`
 	Exclusions         []Diagnostic    `json:"exclusions,omitempty"`
+	Ignored            []Diagnostic    `json:"ignored,omitempty"`
 	Failures           []Diagnostic    `json:"failures,omitempty"`
 	Events             []journal.Event `json:"events,omitempty"`
 }
@@ -163,6 +167,12 @@ func Build(run journal.Run, options Options) Document {
 
 	seenBatches := make(map[string]struct{})
 	failureKeys := make(map[string]struct{})
+	resultBatches := make(map[string]struct{})
+	for _, event := range run.Events {
+		if event.Type == "submission.batch.result" {
+			resultBatches[batchKey(event.Data, event.Type)] = struct{}{}
+		}
+	}
 	events := make([]journal.Event, 0, len(run.Events))
 	for index, event := range run.Events {
 		event = sanitizeEvent(event, options.Secrets)
@@ -194,7 +204,16 @@ func Build(run journal.Run, options Options) Document {
 		case "submission.batch.submitted":
 			key := batchKey(data, event.Type)
 			seenBatches[key] = struct{}{}
-			document.Counts.ImportedScrobbles += parseCount(data["count"], 0)
+			if _, hasResult := resultBatches[key]; !hasResult {
+				document.Counts.ImportedScrobbles += parseCount(data["count"], 0)
+			}
+		case "submission.batch.result":
+			key := batchKey(data, event.Type)
+			seenBatches[key] = struct{}{}
+			document.Counts.ImportedScrobbles += parseCount(data["accepted"], 0)
+		case "submission.scrobble.ignored":
+			document.Counts.IgnoredScrobbles++
+			document.Ignored = append(document.Ignored, diagnosticFromEvent(event))
 		case "submission.batch.failed":
 			key := batchKey(data, event.Type)
 			seenBatches[key] = struct{}{}
@@ -220,6 +239,9 @@ func Build(run journal.Run, options Options) Document {
 	for _, batch := range run.Batches {
 		seenBatches[strconv.Itoa(batch.Sequence)] = struct{}{}
 		if batch.State == journal.StateSubmitted {
+			if _, hasResult := resultBatches[strconv.Itoa(batch.Sequence)]; hasResult {
+				continue
+			}
 			found := false
 			for _, event := range run.Events {
 				if event.Type == "submission.batch.submitted" && event.Data["batch"] == strconv.Itoa(batch.Sequence) {
@@ -274,6 +296,7 @@ func renderCSV(document Document) ([]byte, error) {
 		{"eligibility_rule", document.EligibilityRule, ""},
 		{"batch_delay", document.BatchDelay, ""},
 		{"imported_scrobbles", strconv.Itoa(document.Counts.ImportedScrobbles), ""},
+		{"ignored_scrobbles", strconv.Itoa(document.Counts.IgnoredScrobbles), ""},
 		{"skipped_duplicates", strconv.Itoa(document.Counts.SkippedDuplicates), ""},
 		{"failures", strconv.Itoa(document.Counts.Failures), ""},
 		{"warnings", strconv.Itoa(document.Counts.Warnings), ""},
@@ -299,6 +322,7 @@ func renderCSV(document Document) ([]byte, error) {
 	appendDiagnostics("warning", document.Warnings)
 	appendDiagnostics("metadata_issue", document.MetadataIssues)
 	appendDiagnostics("exclusion", document.Exclusions)
+	appendDiagnostics("ignored", document.Ignored)
 	appendDiagnostics("failure", document.Failures)
 	for _, row := range rows {
 		protected := []string{csvSafe(row[0]), csvSafe(row[1]), csvSafe(row[2])}
@@ -329,6 +353,7 @@ func renderHTML(document Document) []byte {
 	htmlRow("Eligibility rule", document.EligibilityRule)
 	htmlRow("Batch delay", document.BatchDelay)
 	htmlRow("Imported scrobbles", strconv.Itoa(document.Counts.ImportedScrobbles))
+	htmlRow("Ignored scrobbles", strconv.Itoa(document.Counts.IgnoredScrobbles))
 	htmlRow("Skipped duplicates", strconv.Itoa(document.Counts.SkippedDuplicates))
 	htmlRow("Failures", strconv.Itoa(document.Counts.Failures))
 	htmlRow("Warnings", strconv.Itoa(document.Counts.Warnings))
@@ -350,6 +375,7 @@ func renderHTML(document Document) []byte {
 	htmlSection("Warnings", document.Warnings)
 	htmlSection("Metadata issues", document.MetadataIssues)
 	htmlSection("Exclusions", document.Exclusions)
+	htmlSection("Ignored", document.Ignored)
 	htmlSection("Failures", document.Failures)
 	builder.WriteString("</body></html>\n")
 	return []byte(builder.String())
@@ -359,6 +385,7 @@ func diagnosticFromEvent(event journal.Event) Diagnostic {
 	data := event.Data
 	return Diagnostic{
 		Type: event.Type, Input: data["input"], Record: data["record"],
+		Artist: data["artist"], Track: data["track"],
 		Code: data["code"], Reason: data["reason"], Field: data["field"],
 		Batch: data["batch"], Message: data["message"],
 	}

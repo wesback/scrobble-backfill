@@ -23,6 +23,7 @@ import (
 	"github.com/wesback/scrobble-backfill/internal/journal"
 	"github.com/wesback/scrobble-backfill/internal/lastfm"
 	"github.com/wesback/scrobble-backfill/internal/observability"
+	"github.com/wesback/scrobble-backfill/internal/report"
 )
 
 func TestProfileUsePersistsActiveProfile(t *testing.T) {
@@ -390,7 +391,7 @@ func TestImportReportsSubmissionBatchProgressBeforeFinalTotal(t *testing.T) {
 		case "user.getRecentTracks":
 			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
 		case "track.scrobble":
-			fmt.Fprint(w, `{}`)
+			writeAllAcceptedScrobbles(w, r)
 		default:
 			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
 		}
@@ -414,7 +415,7 @@ func TestImportReportsSubmissionBatchProgressBeforeFinalTotal(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
-	finalIndex := indexOfLinePrefix(lines, "Submitted 101 missing plays.")
+	finalIndex := indexOfLinePrefix(lines, "Accepted 101 scrobbles; ignored 0.")
 	if finalIndex < 0 {
 		t.Fatalf("stdout = %q, want final submitted total", stdout.String())
 	}
@@ -456,7 +457,7 @@ func TestImportReportsOnlySuccessfulSubmissionProgressOnPartialFailure(t *testin
 		case "track.scrobble":
 			submissionRequests++
 			if submissionRequests == 1 {
-				fmt.Fprint(w, `{}`)
+				writeAllAcceptedScrobbles(w, r)
 				return
 			}
 			http.Error(w, "rate limited", http.StatusTooManyRequests)
@@ -714,7 +715,7 @@ func TestImportUsesPersistedDefaultsAndCommandLineOverridesWithoutSavingThem(t *
 			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
 		case "track.scrobble":
 			submissionCalls++
-			fmt.Fprint(w, `{}`)
+			writeAllAcceptedScrobbles(w, r)
 		default:
 			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
 		}
@@ -934,7 +935,7 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 			if got := r.PostForm.Get("track[0]"); got != "Missing" {
 				t.Errorf("submitted track = %q, want Missing", got)
 			}
-			fmt.Fprint(w, `{}`)
+			writeAllAcceptedScrobbles(w, r)
 		default:
 			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
 			fmt.Fprint(w, `{}`)
@@ -986,6 +987,124 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 	}
 }
 
+func TestImportReconsidersIgnoredScrobblesWithoutResubmittingHistoryMatches(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	timestamp := time.Date(2024, 1, 2, 12, 0, 0, 0, time.UTC)
+	writeSpotifyAnalysisExport(t, exportPath,
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Accepted","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:accepted"}`, timestamp.Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Ignored","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:ignored"}`, timestamp.Format(time.RFC3339)),
+	)
+
+	var historyRequests int
+	var submitted [][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse Last.fm request: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			historyRequests++
+			if historyRequests <= 2 {
+				fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+				return
+			}
+			fmt.Fprintf(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Accepted","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, timestamp.Unix())
+		case "track.scrobble":
+			tracks := make([]string, 0)
+			for index := 0; r.PostForm.Get(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+				tracks = append(tracks, r.PostForm.Get(fmt.Sprintf("track[%d]", index)))
+			}
+			submitted = append(submitted, tracks)
+			if len(submitted) == 1 {
+				fmt.Fprint(w, `{"scrobbles":{"@attr":{"accepted":1,"ignored":1},"scrobble":[{"ignoredMessage":{"code":0,"#text":""}},{"ignoredMessage":{"code":3,"#text":"Timestamp is too old"}}]}}`)
+				return
+			}
+			writeAllAcceptedScrobbles(w, r)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	journalStore := journal.NewFileStore(filepath.Join(root, "journal"))
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	dependencies := Dependencies{
+		ConfigStore:     configStore,
+		CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+		LastFMClient:    client,
+		JournalStore:    journalStore,
+		Submission:      lastfm.SubmissionOptions{BaselineDelay: 0},
+	}
+	args := []string{"import", "--from", "2024-01-02", "--to", "2024-01-02", exportPath}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("first import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Accepted 1 scrobbles; ignored 1.") ||
+		!strings.Contains(stdout.String(), "Timestamp is too old") {
+		t.Fatalf("first import output = %q, want accepted count and ignored reason", stdout.String())
+	}
+	runs, err := journalStore.ListRuns("personal")
+	if err != nil {
+		t.Fatalf("list first import run: %v", err)
+	}
+	firstRun, err := journalStore.OpenRun("personal", runs[len(runs)-1].InvocationID)
+	if err != nil {
+		t.Fatalf("open first import run: %v", err)
+	}
+	plannedEventFound := false
+	submittedEventFound := false
+	for _, event := range firstRun.Events {
+		if event.Data["batch"] != "1" {
+			continue
+		}
+		switch event.Type {
+		case "submission.batch.planned":
+			plannedEventFound = true
+			if event.Data["count"] != "2" {
+				t.Fatalf("planned event count = %q, want two submitted plays", event.Data["count"])
+			}
+		case "submission.batch.submitted":
+			submittedEventFound = true
+			if event.Data["count"] != "2" {
+				t.Fatalf("submitted event count = %q, want two submitted plays", event.Data["count"])
+			}
+		}
+	}
+	if !plannedEventFound || !submittedEventFound {
+		t.Fatalf("journal events found planned=%t submitted=%t; want both batch events", plannedEventFound, submittedEventFound)
+	}
+	firstReport := report.Build(firstRun, report.Options{})
+	if firstReport.Counts.ImportedScrobbles != 1 || firstReport.Counts.IgnoredScrobbles != 1 ||
+		len(firstReport.Ignored) != 1 || firstReport.Ignored[0].Reason != "Timestamp is too old" {
+		t.Fatalf("first report = %#v, want one accepted and one reasoned ignored scrobble", firstReport)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("second import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if len(submitted) != 2 || !reflect.DeepEqual(submitted[0], []string{"Accepted", "Ignored"}) ||
+		!reflect.DeepEqual(submitted[1], []string{"Ignored"}) {
+		t.Fatalf("submitted batches = %#v, want initial pair then only the ignored play", submitted)
+	}
+	if historyRequests != 4 {
+		t.Fatalf("history requests = %d, want each comparison group queried in both imports", historyRequests)
+	}
+}
+
 func TestImportDryRunPlansBatchesWithoutSubmissionOrMarkingSubmitted(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "history.json")
@@ -1001,7 +1120,7 @@ func TestImportDryRunPlansBatchesWithoutSubmissionOrMarkingSubmitted(t *testing.
 			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
 		case "track.scrobble":
 			submissionCalls++
-			fmt.Fprint(w, `{}`)
+			writeAllAcceptedScrobbles(w, r)
 		default:
 			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
 		}
@@ -1422,7 +1541,7 @@ func TestImportConfirmationThresholdAndYesOverride(t *testing.T) {
 					fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
 				case "track.scrobble":
 					submissionCalls++
-					fmt.Fprint(w, `{}`)
+					writeAllAcceptedScrobbles(w, r)
 				default:
 					t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
 				}
@@ -1463,6 +1582,15 @@ func TestImportConfirmationThresholdAndYesOverride(t *testing.T) {
 			}
 		})
 	}
+}
+
+func writeAllAcceptedScrobbles(w http.ResponseWriter, r *http.Request) {
+	items := make([]string, 0)
+	for index := 0; r.FormValue(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+		items = append(items, `{"ignoredMessage":{"code":"0","#text":""}}`)
+	}
+	fmt.Fprintf(w, `{"scrobbles":{"@attr":{"accepted":"%d","ignored":"0"},"scrobble":[%s]}}`,
+		len(items), strings.Join(items, ","))
 }
 
 func writeSpotifyAnalysisExport(t *testing.T, path string, records ...string) {

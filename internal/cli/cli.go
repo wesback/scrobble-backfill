@@ -1202,7 +1202,15 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "Submitted %d missing plays.\n", len(missing))
+	accepted, ignored := submissionOutcomeCounts(currentRun)
+	fmt.Fprintf(stdout, "Accepted %d scrobbles; ignored %d.\n", accepted, ignored)
+	for _, event := range currentRun.Events {
+		if event.Type != "submission.scrobble.ignored" {
+			continue
+		}
+		fmt.Fprintf(stdout, "  Ignored: %s - %s: %s\n",
+			event.Data["artist"], event.Data["track"], event.Data["reason"])
+	}
 	return 0
 }
 
@@ -1519,13 +1527,62 @@ func runVerify(command []string, options options, stdout, stderr io.Writer, depe
 
 func submittedPayloads(run journal.Run) []journal.Submission {
 	var submissions []journal.Submission
+	ignored := make(map[int]map[int]struct{})
+	for _, event := range run.Events {
+		if event.Type != "submission.scrobble.ignored" {
+			continue
+		}
+		batch, batchErr := strconv.Atoi(event.Data["batch"])
+		index, indexErr := strconv.Atoi(event.Data["index"])
+		if batchErr != nil || indexErr != nil || batch < 1 || index < 1 {
+			continue
+		}
+		if ignored[batch] == nil {
+			ignored[batch] = make(map[int]struct{})
+		}
+		ignored[batch][index] = struct{}{}
+	}
 	for _, batch := range run.Batches {
 		if batch.State != journal.StateSubmitted {
 			continue
 		}
-		submissions = append(submissions, batch.Payloads...)
+		for index, payload := range batch.Payloads {
+			if _, wasIgnored := ignored[batch.Sequence][index+1]; !wasIgnored {
+				submissions = append(submissions, payload)
+			}
+		}
 	}
 	return submissions
+}
+
+func submissionOutcomeCounts(run journal.Run) (accepted, ignored int) {
+	results := make(map[int]int)
+	for _, event := range run.Events {
+		if event.Type != "submission.batch.result" {
+			continue
+		}
+		batch, batchErr := strconv.Atoi(event.Data["batch"])
+		count, countErr := strconv.Atoi(event.Data["accepted"])
+		if batchErr == nil && countErr == nil && batch > 0 && count >= 0 {
+			results[batch] = count
+		}
+	}
+	for _, batch := range run.Batches {
+		if batch.State != journal.StateSubmitted {
+			continue
+		}
+		if count, hasResult := results[batch.Sequence]; hasResult {
+			accepted += count
+		} else {
+			accepted += len(batch.Payloads)
+		}
+	}
+	for _, event := range run.Events {
+		if event.Type == "submission.scrobble.ignored" {
+			ignored++
+		}
+	}
+	return accepted, ignored
 }
 
 func parseAnalysisDate(value string, location *time.Location) (time.Time, error) {
