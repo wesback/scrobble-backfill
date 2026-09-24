@@ -797,6 +797,62 @@ func TestImportUsesPersistedDefaultsAndCommandLineOverridesWithoutSavingThem(t *
 	}
 }
 
+func TestAnalyseWarnsWhenDurationLookupPermanentlyFails(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeSpotifyAnalysisExport(t, exportPath,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":100000,"master_metadata_track_name":"Short Track","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:short"}`,
+	)
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		if method := r.PostForm.Get("method"); method != "track.getInfo" {
+			t.Errorf("Last.fm method = %q, want track.getInfo", method)
+		}
+		requests++
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"error":6,"message":"track lookup denied"}`)
+	}))
+	defer server.Close()
+
+	store := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := store.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"analyse", "--from=2024-01-02", "--to=2024-01-02", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     store,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session-secret"}},
+			LastFMClient:    client,
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if requests != 1 {
+		t.Fatalf("duration lookup requests = %d, want 1", requests)
+	}
+	if !strings.Contains(stderr.String(), `warning: duration_lookup_failed: Last.fm duration lookup failed for artist "Artist", track "Short Track":`) {
+		t.Fatalf("stderr = %q, want warning identifying failed track", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "session-secret") {
+		t.Fatalf("stderr exposes session credential: %q", stderr.String())
+	}
+}
+
 func TestAnalyseReportsProfileBoundsConfidenceAndExclusionsWithoutMutatingState(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "history.json")

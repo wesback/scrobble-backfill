@@ -753,6 +753,12 @@ func resolveExistingProfile(options options, store config.Store) (string, error)
 	return name, nil
 }
 
+func durationLookupWarningHandler(stderr io.Writer) lastfm.EligibilityLookupFailureHandler {
+	return func(artist, track string, err error) {
+		fmt.Fprintf(stderr, "warning: duration_lookup_failed: Last.fm duration lookup failed for artist %q, track %q: %v\n", artist, track, err)
+	}
+}
+
 func runAnalyse(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(command) == 0 {
 		fmt.Fprintln(stderr, "error: analyse requires at least one Spotify export input")
@@ -837,11 +843,12 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 		dependencies.LastFMClient,
 		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
 		lastfm.ComparisonRequest{
-			From:                  from,
-			To:                    to,
-			Timezone:              location,
-			TimestampTolerance:    timestampTolerance,
-			TimestampToleranceSet: timestampToleranceSet,
+			From:                         from,
+			To:                           to,
+			Timezone:                     location,
+			TimestampTolerance:           timestampTolerance,
+			TimestampToleranceSet:        timestampToleranceSet,
+			DurationLookupFailureHandler: durationLookupWarningHandler(stderr),
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
 				deliveredRecords := 0
 				progressingConsume := func(play spotify.Play) error {
@@ -1056,11 +1063,12 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		dependencies.LastFMClient,
 		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
 		lastfm.ComparisonRequest{
-			From:                  from,
-			To:                    to,
-			Timezone:              location,
-			TimestampTolerance:    timestampTolerance,
-			TimestampToleranceSet: timestampToleranceSet,
+			From:                         from,
+			To:                           to,
+			Timezone:                     location,
+			TimestampTolerance:           timestampTolerance,
+			TimestampToleranceSet:        timestampToleranceSet,
+			DurationLookupFailureHandler: durationLookupWarningHandler(stderr),
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
 				deliveredRecords := 0
 				progressingConsume := func(play spotify.Play) error {

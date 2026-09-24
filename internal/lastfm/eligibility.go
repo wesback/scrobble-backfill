@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wesback/scrobble-backfill/internal/spotify"
 )
@@ -55,22 +56,51 @@ type durationLookup struct {
 	fallbackReason EligibilityFallbackReason
 }
 
+// EligibilityLookupFailureHandler receives a duration lookup failure after
+// all retry attempts have been exhausted.
+type EligibilityLookupFailureHandler func(artist, track string, err error)
+
+// EligibilitySleeper waits before retrying a duration lookup.
+type EligibilitySleeper func(context.Context, time.Duration) error
+
+// EligibilityOptions controls duration lookup retries and failure reporting.
+type EligibilityOptions struct {
+	// BaselineDelay is used for the first retry. Zero selects
+	// DefaultSubmissionDelay.
+	BaselineDelay time.Duration
+	// MaxRetries is the number of retries after the initial lookup. Zero
+	// selects DefaultSubmissionMaxRetries.
+	MaxRetries int
+	// Sleep replaces the real timer in tests. Nil uses a context-aware timer.
+	Sleep EligibilitySleeper
+	// LookupFailureHandler is called once when a track's lookup permanently
+	// fails. Nil disables failure reporting.
+	LookupFailureHandler EligibilityLookupFailureHandler
+}
+
 // EligibilityEvaluator applies Last.fm's scrobble eligibility rule. Its
 // duration cache belongs to one comparison run: create one evaluator for each
 // run and discard it when the run ends.
 type EligibilityEvaluator struct {
 	client  *Client
 	profile AuthenticatedProfile
+	options EligibilityOptions
 
 	mu        sync.Mutex
 	durations map[string]durationLookup
 }
 
 // NewEligibilityEvaluator creates an evaluator with an empty run-local cache.
-func NewEligibilityEvaluator(client *Client, profile AuthenticatedProfile) *EligibilityEvaluator {
+func NewEligibilityEvaluator(client *Client, profile AuthenticatedProfile, options ...EligibilityOptions) *EligibilityEvaluator {
+	selected := EligibilityOptions{}
+	if len(options) > 0 {
+		selected = options[0]
+	}
+	selected = normalizeEligibilityOptions(selected)
 	return &EligibilityEvaluator{
 		client:    client,
 		profile:   profile,
+		options:   selected,
 		durations: make(map[string]durationLookup),
 	}
 }
@@ -109,7 +139,10 @@ func (e *EligibilityEvaluator) Evaluate(ctx context.Context, play spotify.Play) 
 		}, nil
 	}
 
-	lookup := e.duration(ctx, artist, track)
+	lookup, err := e.duration(ctx, artist, track)
+	if err != nil {
+		return EligibilityDecision{}, err
+	}
 	if lookup.fallbackReason != "" {
 		return EligibilityDecision{
 			Reason:         EligibilityReasonBelowHalf,
@@ -134,31 +167,72 @@ func (e *EligibilityEvaluator) IsEligible(ctx context.Context, play spotify.Play
 	return decision.Eligible, decision, err
 }
 
-func (e *EligibilityEvaluator) duration(ctx context.Context, artist, track string) durationLookup {
+func (e *EligibilityEvaluator) duration(ctx context.Context, artist, track string) (durationLookup, error) {
 	key := canonicalTrackKey(artist, track)
 
 	// Hold the lock through the request so concurrent plays of the same track
 	// cannot issue duplicate requests within one comparison run.
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if lookup, ok := e.durations[key]; ok {
-		return lookup
+		e.mu.Unlock()
+		return lookup, nil
 	}
 
-	payload, err := e.client.Call(ctx, "track.getInfo", map[string]string{
-		"artist": artist,
-		"track":  track,
-	}, e.profile.SessionKey)
-	if err != nil {
-		lookup := durationLookup{fallbackReason: EligibilityFallbackLookupFailed}
-		e.durations[key] = lookup
-		return lookup
+	for attempt := 0; ; attempt++ {
+		payload, err := e.client.Call(ctx, "track.getInfo", map[string]string{
+			"artist": artist,
+			"track":  track,
+		}, e.profile.SessionKey)
+		if err == nil {
+			duration, reason := parseTrackDuration(payload)
+			lookup := durationLookup{duration: duration, fallbackReason: reason}
+			e.durations[key] = lookup
+			e.mu.Unlock()
+			return lookup, nil
+		}
+		if !retryableSubmissionError(err) || attempt >= e.options.MaxRetries {
+			lookup := durationLookup{fallbackReason: EligibilityFallbackLookupFailed}
+			e.durations[key] = lookup
+			handler := e.options.LookupFailureHandler
+			safeErr := errors.New(redactSession(err.Error(), e.profile.SessionKey))
+			e.mu.Unlock()
+			if handler != nil {
+				handler(artist, track, safeErr)
+			}
+			return lookup, nil
+		}
+		delay := retryDelay(e.options.BaselineDelay, attempt)
+		if delay <= 0 {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			e.mu.Unlock()
+			return durationLookup{}, err
+		}
+		if err := e.options.Sleep(ctx, delay); err != nil {
+			e.mu.Unlock()
+			return durationLookup{}, fmt.Errorf("wait to retry Last.fm duration lookup: %w", err)
+		}
 	}
+}
 
-	duration, reason := parseTrackDuration(payload)
-	lookup := durationLookup{duration: duration, fallbackReason: reason}
-	e.durations[key] = lookup
-	return lookup
+func normalizeEligibilityOptions(options EligibilityOptions) EligibilityOptions {
+	if options.BaselineDelay == 0 {
+		options.BaselineDelay = DefaultSubmissionDelay
+	}
+	if options.BaselineDelay < 0 {
+		options.BaselineDelay = 0
+	}
+	if options.MaxRetries == 0 {
+		options.MaxRetries = DefaultSubmissionMaxRetries
+	}
+	if options.MaxRetries < 0 {
+		options.MaxRetries = 0
+	}
+	if options.Sleep == nil {
+		options.Sleep = sleepWithContext
+	}
+	return options
 }
 
 func parseTrackDuration(payload map[string]any) (int64, EligibilityFallbackReason) {
