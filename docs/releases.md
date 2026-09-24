@@ -63,7 +63,11 @@ Do not run a binary if attestation verification fails.
 
 ## Publishing
 
-Maintainers publish a release by pushing a version tag such as `v1.0.0`.
+Maintainers publish a release from a clean, up-to-date `main` checkout by
+running `scripts/tag-release.sh v1.0.0`. The helper validates the version,
+repository state, existing tags, and Go tests before creating and pushing the
+annotated tag. Do not use `git push --tags` to publish a release.
+
 GitHub Actions builds the four binaries on their target runners,
 validates `--help` and `--version`, injects the tag as the binary version,
 generates `SHA256SUMS`, attests each binary's build provenance, and publishes
