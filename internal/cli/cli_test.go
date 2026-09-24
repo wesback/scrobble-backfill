@@ -161,6 +161,87 @@ func TestLogLevelOptionRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
+func TestParseOperationalDurations(t *testing.T) {
+	tests := []struct {
+		name  string
+		parse func(string) (time.Duration, error)
+		value string
+		want  time.Duration
+	}{
+		{name: "timestamp tolerance bare seconds", parse: parseTimestampTolerance, value: "60", want: 60 * time.Second},
+		{name: "timestamp tolerance duration", parse: parseTimestampTolerance, value: "1m30s", want: 90 * time.Second},
+		{name: "batch delay bare seconds", parse: parseBatchDelay, value: "2", want: 2 * time.Second},
+		{name: "batch delay duration", parse: parseBatchDelay, value: "150ms", want: 150 * time.Millisecond},
+		{name: "largest bare seconds value", parse: parseBatchDelay, value: "9223372036", want: time.Duration(9223372036) * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.parse(test.value)
+			if err != nil {
+				t.Fatalf("parse %q: %v", test.value, err)
+			}
+			if got != test.want {
+				t.Fatalf("parsed duration = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseOperationalDurationsRejectsSecondsOverflow(t *testing.T) {
+	tests := []struct {
+		name string
+		flag string
+	}{
+		{name: "timestamp tolerance", flag: "--timestamp-tolerance"},
+		{name: "batch delay", flag: "--batch-delay"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := parseArgs([]string{test.flag, "9223372037", "import"})
+			if err == nil {
+				t.Fatal("expected seconds overflow to be rejected")
+			}
+			if !strings.Contains(err.Error(), test.flag) || !strings.Contains(err.Error(), "overflows time.Duration") {
+				t.Fatalf("error = %q, want clear overflow error for %s", err, test.flag)
+			}
+		})
+	}
+}
+
+func TestImportRejectsOverflowingBatchDelayBeforeSubmission(t *testing.T) {
+	var submissionRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		if r.PostForm.Get("method") == "track.scrobble" {
+			submissionRequests++
+		}
+		fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--batch-delay", "9223372037"},
+		&stdout,
+		&stderr,
+		Dependencies{LastFMClient: client},
+	)
+	if exitCode != 2 {
+		t.Fatalf("exit code = %d, want argument error; stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--batch-delay seconds value overflows time.Duration") {
+		t.Fatalf("stderr = %q, want batch-delay overflow error", stderr.String())
+	}
+	if submissionRequests != 0 {
+		t.Fatalf("submission requests = %d, want no submission for invalid delay", submissionRequests)
+	}
+}
+
 func TestAnalyseReportsIngestionProgressBeforeSummary(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "history.json")

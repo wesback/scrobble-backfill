@@ -295,7 +295,7 @@ func parseTimestampTolerance(value string) (time.Duration, error) {
 	}
 	seconds, integerErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if integerErr == nil && seconds >= 0 {
-		return time.Duration(seconds) * time.Second, nil
+		return durationFromSeconds(seconds, "--timestamp-tolerance")
 	}
 	return 0, fmt.Errorf("--timestamp-tolerance must be a non-negative duration (for example 60s): %w", err)
 }
@@ -310,9 +310,17 @@ func parseBatchDelay(value string) (time.Duration, error) {
 	}
 	seconds, integerErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 	if integerErr == nil && seconds >= 0 {
-		return time.Duration(seconds) * time.Second, nil
+		return durationFromSeconds(seconds, "--batch-delay")
 	}
 	return 0, fmt.Errorf("--batch-delay must be a non-negative duration (for example 1s): %w", err)
+}
+
+func durationFromSeconds(seconds int64, option string) (time.Duration, error) {
+	const maxSeconds = int64((1<<63 - 1) / int64(time.Second))
+	if seconds > maxSeconds {
+		return 0, fmt.Errorf("%s seconds value overflows time.Duration", option)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func runProfile(command []string, options options, stdout, stderr io.Writer, store config.Store) int {
