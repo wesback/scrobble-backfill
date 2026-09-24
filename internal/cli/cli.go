@@ -115,8 +115,8 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 		printUsage(stderr)
 		return 2
 	}
+	logger := observability.NewLogger(stderr, options.logLevel)
 	if options.logLevelExplicit {
-		logger := observability.NewLogger(stderr, options.logLevel)
 		if err := logger.Normal("command.started", map[string]any{"command": command[0]}); err != nil {
 			fmt.Fprintf(stderr, "error: write normal log event: %v\n", err)
 			return 1
@@ -135,7 +135,7 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 	case "profile":
 		return runProfile(command[1:], options, stdout, stderr, dependencies.ConfigStore)
 	case "login":
-		return runLogin(options, stdout, stderr, dependencies)
+		return runLogin(options, stdout, stderr, dependencies, logger)
 	case "logout":
 		return runLogout(options, stdout, stderr, dependencies)
 	case "status":
@@ -372,7 +372,7 @@ func runProfile(command []string, options options, stdout, stderr io.Writer, sto
 	return 0
 }
 
-func runLogin(options options, stdout, stderr io.Writer, dependencies Dependencies) int {
+func runLogin(options options, stdout, stderr io.Writer, dependencies Dependencies, logger *observability.Logger) int {
 	if dependencies.ConfigStore == nil {
 		fmt.Fprintln(stderr, "error: configuration store is unavailable")
 		return 1
@@ -400,6 +400,7 @@ func runLogin(options options, stdout, stderr io.Writer, dependencies Dependenci
 		printCredentialError(stderr, "load existing credential", previousErr)
 		return 1
 	}
+	dependencies.LastFMClient.Logger = logger
 	session, err := dependencies.LastFMClient.Authenticate(context.Background(), stdout, dependencies.Input)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
