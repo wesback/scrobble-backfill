@@ -66,6 +66,12 @@ type Client struct {
 	BaseURL    string
 	HTTPClient *http.Client
 	OpenURL    func(string) error
+	Logger     DiagnosticLogger
+}
+
+// DiagnosticLogger records debug events for non-fatal client diagnostics.
+type DiagnosticLogger interface {
+	Debug(string, map[string]any) error
 }
 
 // Session is the non-secret metadata returned by auth.getSession. Key is
@@ -93,8 +99,8 @@ func NewClientFromEnv() *Client {
 }
 
 // Authenticate performs Last.fm's auth.getToken -> browser authorization ->
-// auth.getSession flow. The authorization URL is opened in the user's default
-// browser, but is never printed because it contains the application key.
+// auth.getSession flow. If the authorization URL cannot be opened in the
+// user's default browser, it is printed for manual authorization.
 func (c *Client) Authenticate(ctx context.Context, out io.Writer, in io.Reader) (Session, error) {
 	if err := c.validate(); err != nil {
 		return Session{}, err
@@ -117,9 +123,13 @@ func (c *Client) Authenticate(ctx context.Context, out io.Writer, in io.Reader) 
 		opener = openURL
 	}
 	if err := opener(authorizationURL); err != nil {
-		return Session{}, fmt.Errorf("open Last.fm authorization page: %w", err)
-	}
-	if out != nil {
+		if out != nil {
+			fmt.Fprintf(out, "Could not open Last.fm's authorization page automatically. Open this URL manually, authorize the displayed token, then press Enter:\n%s\n", authorizationURL)
+		}
+		if c.Logger != nil {
+			_ = c.Logger.Debug("lastfm.authorization.browser_open_failed", map[string]any{"error": err.Error()})
+		}
+	} else if out != nil {
 		fmt.Fprintf(out, "Last.fm's authorization page was opened in your browser. Authorize the displayed token, then press Enter.\n")
 	}
 	if in == nil {
@@ -148,8 +158,9 @@ func (c *Client) Authenticate(ctx context.Context, out io.Writer, in io.Reader) 
 	return Session{Name: name, Key: key}, nil
 }
 
-// AuthorizationURL returns the official Last.fm authorization URL. Callers
-// should avoid printing it because it contains the application key.
+// AuthorizationURL returns the official Last.fm authorization URL, which
+// contains the application key and should only be printed for manual
+// authorization when opening the browser fails.
 func (c *Client) AuthorizationURL(token string) (string, error) {
 	if err := c.validate(); err != nil {
 		return "", err

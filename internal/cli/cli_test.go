@@ -1101,11 +1101,11 @@ func TestLoginStoresSessionAndActivatesFirstProfile(t *testing.T) {
 	var openedURL string
 	client.OpenURL = func(rawURL string) error {
 		openedURL = rawURL
-		return nil
+		return errors.New("browser unavailable")
 	}
 	var stdout, stderr bytes.Buffer
 	exitCode := RunWithDependencies(
-		[]string{"--profile", "personal", "login"},
+		[]string{"--debug", "--profile", "personal", "login"},
 		&stdout,
 		&stderr,
 		Dependencies{
@@ -1144,6 +1144,13 @@ func TestLoginStoresSessionAndActivatesFirstProfile(t *testing.T) {
 	if got := authorizationURL.Query().Get("api_key"); got != "app-key" {
 		t.Fatalf("opened authorization API key = %q, want app-key", got)
 	}
+	if !strings.Contains(stdout.String(), openedURL) {
+		t.Fatalf("stdout = %q, want manual authorization URL %q", stdout.String(), openedURL)
+	}
+	if !strings.Contains(stderr.String(), `"event":"lastfm.authorization.browser_open_failed"`) ||
+		!strings.Contains(stderr.String(), `"error":"browser unavailable"`) {
+		t.Fatalf("stderr = %q, want debug event recording browser opener error", stderr.String())
+	}
 	configData, err := os.ReadFile(store.Path)
 	if err != nil {
 		t.Fatalf("read persisted config: %v", err)
@@ -1151,11 +1158,8 @@ func TestLoginStoresSessionAndActivatesFirstProfile(t *testing.T) {
 	if strings.Contains(string(configData), "session-secret") || strings.Contains(string(configData), "app-secret") || strings.Contains(string(configData), "app-key") {
 		t.Fatalf("persisted config exposes a credential: %q", configData)
 	}
-	if strings.Contains(stdout.String(), "app-key") || strings.Contains(stdout.String(), "app-secret") || strings.Contains(stdout.String(), "session-secret") {
+	if strings.Contains(stdout.String(), "app-secret") || strings.Contains(stdout.String(), "session-secret") {
 		t.Fatalf("stdout exposes a credential: %q", stdout.String())
-	}
-	if strings.Contains(stdout.String(), "login-token") {
-		t.Fatalf("stdout exposes the authorization token: %q", stdout.String())
 	}
 }
 
