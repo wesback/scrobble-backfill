@@ -265,26 +265,33 @@ func TestAnalyseReportsIngestionProgressBeforeSummary(t *testing.T) {
 		t.Fatalf("stdout = %q, want analysis summary", stdout.String())
 	}
 
-	var updateCounts []int
+	var progressLines []string
 	lastUpdateIndex := -1
 	for index, line := range lines[:summaryIndex] {
-		var count, total int
-		if _, err := fmt.Sscanf(line, "progress: %d/%d", &count, &total); err == nil {
-			updateCounts = append(updateCounts, count)
+		if strings.HasPrefix(line, "progress: ") {
+			progressLines = append(progressLines, line)
 			lastUpdateIndex = index
 		}
 	}
-	if !reflect.DeepEqual(updateCounts, []int{1000, 2000}) {
-		t.Fatalf("progress update counts = %v, want [1000 2000] before summary; stdout = %q",
-			updateCounts, stdout.String())
+	if !reflect.DeepEqual(progressLines, []string{
+		"progress: 1000/unknown records ingested",
+		"progress: 2000/unknown records ingested",
+	}) {
+		t.Fatalf("progress updates = %q, want unknown-total updates for 1000 and 2000 records; stdout = %q",
+			progressLines, stdout.String())
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "progress") && strings.Contains(line, "/0") {
+			t.Fatalf("progress line = %q, want no zero total; stdout = %q", line, stdout.String())
+		}
 	}
 	completionIndex := indexOfLinePrefix(lines, "progress complete:")
 	if completionIndex <= lastUpdateIndex || completionIndex >= summaryIndex {
 		t.Fatalf("completion line index = %d, last update index = %d, summary index = %d; stdout = %q",
 			completionIndex, lastUpdateIndex, summaryIndex, stdout.String())
 	}
-	if !strings.Contains(lines[completionIndex], "2500 records ingested") {
-		t.Fatalf("completion line = %q, want final count of 2500 records", lines[completionIndex])
+	if lines[completionIndex] != "progress complete: 2500 records ingested" {
+		t.Fatalf("completion line = %q, want %q", lines[completionIndex], "progress complete: 2500 records ingested")
 	}
 }
 
@@ -332,18 +339,20 @@ func TestImportDryRunReportsIngestionProgressBeforeSummary(t *testing.T) {
 		t.Fatalf("stdout = %q, want import summary", stdout)
 	}
 
-	var updateCounts []int
+	var progressLines []string
 	lastUpdateIndex := -1
 	for index, line := range lines[:summaryIndex] {
-		var count, total int
-		if _, err := fmt.Sscanf(line, "progress: %d/%d", &count, &total); err == nil {
-			updateCounts = append(updateCounts, count)
+		if strings.HasPrefix(line, "progress: ") {
+			progressLines = append(progressLines, line)
 			lastUpdateIndex = index
 		}
 	}
-	if !reflect.DeepEqual(updateCounts, []int{1000, 2000}) {
-		t.Fatalf("progress update counts = %v, want [1000 2000] before summary; stdout = %q",
-			updateCounts, stdout)
+	if !reflect.DeepEqual(progressLines, []string{
+		"progress: 1000/unknown records ingested",
+		"progress: 2000/unknown records ingested",
+	}) {
+		t.Fatalf("progress updates = %q, want unknown-total updates for 1000 and 2000 records; stdout = %q",
+			progressLines, stdout)
 	}
 	completionIndex := indexOfLinePrefix(lines, "progress complete:")
 	if completionIndex <= lastUpdateIndex || completionIndex >= summaryIndex {
