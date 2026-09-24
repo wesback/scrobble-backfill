@@ -152,8 +152,173 @@ func TestCompareReadsHistoryBeforeSpotifySourceCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compare: %v", err)
 	}
-	if summary.Eligible != 2 || len(results) != 2 || historyCalls != 2 {
-		t.Fatalf("summary = %#v, results = %d, history calls = %d; want two results and two bounded reads", summary, len(results), historyCalls)
+	if summary.Eligible != 2 || len(results) != 2 || historyCalls != 1 {
+		t.Fatalf("summary = %#v, results = %d, history calls = %d; want two results and one history read", summary, len(results), historyCalls)
+	}
+}
+
+func TestCompareReadsEachHistoryPageOnceForDisjointTrackGroups(t *testing.T) {
+	base := time.Date(2024, 2, 3, 12, 0, 0, 0, time.UTC)
+	pageRequests := make(map[string]int)
+	server := comparisonServer(t, func(values url.Values) string {
+		page := values.Get("page")
+		pageRequests[page]++
+		switch page {
+		case "1":
+			return `{"recenttracks":{"track":[` +
+				historyTrack("Artist", "First", base) +
+				`],"@attr":{"totalPages":"2"}}}`
+		case "2":
+			return `{"recenttracks":{"track":[` +
+				historyTrack("Artist", "Third", base.Add(10*time.Minute+3*time.Second)) +
+				`],"@attr":{"totalPages":"2"}}}`
+		default:
+			t.Errorf("requested unexpected history page %q", page)
+			return `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`
+		}
+	})
+	defer server.Close()
+
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var results []ComparisonResult
+	summary, err := Compare(ctxForTest(), client, AuthenticatedProfile{
+		Username: "alice", SessionKey: "session",
+	}, ComparisonRequest{
+		From:               base,
+		To:                 base,
+		Timezone:           time.UTC,
+		TimestampTolerance: 10 * time.Second,
+		Plays: sourceForTest(
+			spotify.Play{ArtistName: "Artist", TrackName: "First", Timestamp: base, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Second", Timestamp: base.Add(5 * time.Minute), Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Third", Timestamp: base.Add(10 * time.Minute), Milliseconds: 240_000},
+		),
+	}, func(result ComparisonResult) error {
+		results = append(results, result)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if len(results) != 3 ||
+		results[0].Status != ComparisonStatusMatched || results[0].Confidence != ComparisonConfidenceHigh ||
+		results[1].Status != ComparisonStatusMissing ||
+		results[2].Status != ComparisonStatusMatched || results[2].Confidence != ComparisonConfidenceHigh {
+		t.Fatalf("results = %#v, want matched, missing, matched with high confidence for matches", results)
+	}
+	if summary.Matched != 2 || summary.Missing != 1 || summary.LastFMScrobbles != 2 {
+		t.Fatalf("summary = %#v, want two matches, one missing, and two history records", summary)
+	}
+	if pageRequests["1"] != 1 || pageRequests["2"] != 1 || len(pageRequests) != 2 {
+		t.Fatalf("history page requests = %v, want each of pages 1 and 2 exactly once", pageRequests)
+	}
+}
+
+func TestCompareMatchesEachRepeatedHistoryOccurrenceAtMostOnce(t *testing.T) {
+	base := time.Date(2024, 2, 3, 12, 0, 0, 0, time.UTC)
+	server := comparisonServer(t, func(url.Values) string {
+		record := historyTrack("Artist", "Track", base)
+		return `{"recenttracks":{"track":[` + record + "," + record + `],"@attr":{"totalPages":"1"}}}`
+	})
+	defer server.Close()
+
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var results []ComparisonResult
+	summary, err := Compare(ctxForTest(), client, AuthenticatedProfile{
+		Username: "alice", SessionKey: "session",
+	}, ComparisonRequest{
+		From:     base,
+		To:       base,
+		Timezone: time.UTC,
+		Plays: sourceForTest(
+			spotify.Play{ArtistName: "Artist", TrackName: "Track", Timestamp: base, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Track", Timestamp: base, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Track", Timestamp: base, Milliseconds: 240_000},
+		),
+	}, func(result ComparisonResult) error {
+		results = append(results, result)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if len(results) != 3 || summary.Matched != 2 || summary.Missing != 1 {
+		t.Fatalf("summary = %#v, results = %#v; want two matches for two history occurrences", summary, results)
+	}
+	for index, want := range []ComparisonStatus{
+		ComparisonStatusMatched,
+		ComparisonStatusMatched,
+		ComparisonStatusMissing,
+	} {
+		if results[index].Status != want {
+			t.Errorf("result %d status = %q, want %q", index, results[index].Status, want)
+		}
+	}
+}
+
+func TestCompareIncludesDateBoundariesAndPreservesConfidenceTiers(t *testing.T) {
+	start := time.Date(2024, 4, 5, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 0, 1).Add(-time.Nanosecond)
+	near := start.Add(10*time.Minute + 3*time.Second)
+	variant := start.Add(20 * time.Minute)
+	outside := end.Add(time.Second)
+	server := comparisonServer(t, func(url.Values) string {
+		return `{"recenttracks":{"track":[` +
+			historyTrack("Artist", "Opening", start) + "," +
+			historyTrack("Artist", "Near", near.Add(-3*time.Second)) + "," +
+			historyTrack("Artist", "Tune", variant) + "," +
+			historyTrack("Artist", "Closing", end) + "," +
+			historyTrack("Artist", "Outside", outside) +
+			`],"@attr":{"totalPages":"1"}}}`
+	})
+	defer server.Close()
+
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var results []ComparisonResult
+	summary, err := Compare(ctxForTest(), client, AuthenticatedProfile{
+		Username: "alice", SessionKey: "session",
+	}, ComparisonRequest{
+		From:               start.Add(12 * time.Hour),
+		To:                 start.Add(23 * time.Hour),
+		Timezone:           time.UTC,
+		TimestampTolerance: 20 * time.Second,
+		Plays: sourceForTest(
+			spotify.Play{ArtistName: "Artist", TrackName: "Opening", Timestamp: start, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Near", Timestamp: near, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Tune (Remastered)", Timestamp: variant, Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Outside", Timestamp: start.Add(30 * time.Minute), Milliseconds: 240_000},
+			spotify.Play{ArtistName: "Artist", TrackName: "Closing", Timestamp: end, Milliseconds: 240_000},
+		),
+	}, func(result ComparisonResult) error {
+		results = append(results, result)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if summary.FromUTC != start || !summary.ToUTC.Equal(end) || summary.LastFMScrobbles != 4 {
+		t.Fatalf("bounds = [%s, %s], history records = %d; want [%s, %s] and four in-range records",
+			summary.FromUTC, summary.ToUTC, summary.LastFMScrobbles, start, end)
+	}
+	if len(results) != 5 {
+		t.Fatalf("results = %d, want five", len(results))
+	}
+	for _, index := range []int{0, 1, 4} {
+		if results[index].Status != ComparisonStatusMatched || results[index].Confidence != ComparisonConfidenceHigh {
+			t.Errorf("result %d = status %q confidence %q, want high-confidence match", index, results[index].Status, results[index].Confidence)
+		}
+	}
+	if results[2].Status != ComparisonStatusMissing ||
+		results[2].Confidence != ComparisonConfidenceLow ||
+		results[2].Scrobble == nil ||
+		results[2].Scrobble.Track != "Tune" {
+		t.Errorf("metadata variant result = %#v, want low-confidence missing with its candidate scrobble", results[2])
+	}
+	if results[3].Status != ComparisonStatusMissing || results[3].Scrobble != nil {
+		t.Errorf("outside-range result = %#v, want missing without an out-of-range candidate", results[3])
 	}
 }
 
@@ -341,8 +506,8 @@ func TestCompareDoesNotReuseHistoryAcrossOutOfOrderSourceGroups(t *testing.T) {
 	if summary.LastFMScrobbles != 1 {
 		t.Fatalf("LastFMScrobbles = %d, want one unique history record", summary.LastFMScrobbles)
 	}
-	if historyCalls != 3 {
-		t.Fatalf("history calls = %d, want one bounded read per source group", historyCalls)
+	if historyCalls != 1 {
+		t.Fatalf("history calls = %d, want one history read for all source groups", historyCalls)
 	}
 	if results[0].Status != ComparisonStatusMatched || results[1].Status != ComparisonStatusMissing ||
 		results[2].Status != ComparisonStatusMissing {
