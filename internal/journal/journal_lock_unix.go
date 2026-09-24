@@ -9,11 +9,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-type profileLock struct {
+type unixProfileLock struct {
 	file *os.File
 }
 
-func acquireProfileFileLock(path string) (*profileLock, error) {
+func acquireProfileFileLock(path string) (profileLock, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
@@ -22,10 +22,10 @@ func acquireProfileFileLock(path string) (*profileLock, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	return &profileLock{file: file}, nil
+	return &unixProfileLock{file: file}, nil
 }
 
-func (lock *profileLock) Close() error {
+func (lock *unixProfileLock) Close() error {
 	if lock == nil || lock.file == nil {
 		return nil
 	}
