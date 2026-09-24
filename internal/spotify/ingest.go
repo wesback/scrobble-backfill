@@ -519,7 +519,6 @@ func processRecord(ctx context.Context, input string, number int, raw json.RawMe
 		{"platform", record.Platform},
 		{"master_metadata_track_name", record.TrackName},
 		{"master_metadata_album_artist_name", record.ArtistName},
-		{"master_metadata_album_album_name", record.AlbumName},
 	}
 	for _, field := range requiredStrings {
 		if field.value == nil || strings.TrimSpace(*field.value) == "" {
@@ -562,7 +561,7 @@ func processRecord(ctx context.Context, input string, number int, raw json.RawMe
 	play := Play{
 		TrackName:       strings.TrimSpace(*record.TrackName),
 		ArtistName:      strings.TrimSpace(*record.ArtistName),
-		AlbumName:       strings.TrimSpace(*record.AlbumName),
+		AlbumName:       strings.TrimSpace(pointerValue(record.AlbumName)),
 		Timestamp:       playedAt,
 		Milliseconds:    *record.Milliseconds,
 		Platform:        strings.TrimSpace(*record.Platform),

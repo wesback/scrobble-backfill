@@ -75,6 +75,94 @@ func TestIngestNormalizesMusicRecordsAndReportsSkippedInputs(t *testing.T) {
 	}
 }
 
+func TestIngestTreatsAlbumMetadataAsOptional(t *testing.T) {
+	nullAlbum := strings.Replace(
+		recordJSON("Track", "Artist", "Album", "spotify:track:null-album"),
+		`"master_metadata_album_album_name":"Album"`,
+		`"master_metadata_album_album_name":null`,
+		1,
+	)
+	tests := []struct {
+		name   string
+		record string
+	}{
+		{name: "null album", record: nullAlbum},
+		{name: "empty album", record: recordJSON("Track", "Artist", "", "spotify:track:empty-album")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var plays []Play
+			var warnings []Warning
+			summary, err := Ingest(context.Background(), []Input{{
+				Name:   "history.json",
+				Reader: strings.NewReader("[" + test.record + "]"),
+			}}, func(play Play) error {
+				plays = append(plays, play)
+				return nil
+			}, func(warning Warning) {
+				warnings = append(warnings, warning)
+			})
+			if err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if len(plays) != 1 || summary.Emitted != 1 || plays[0].AlbumName != "" {
+				t.Fatalf("plays = %#v, summary = %#v; want one play with empty album", plays, summary)
+			}
+			for _, warning := range warnings {
+				if warning.Code == CodeMissingField && warning.Field == "master_metadata_album_album_name" {
+					t.Fatalf("album produced a missing-field warning: %#v", warning)
+				}
+			}
+		})
+	}
+}
+
+func TestIngestStillRequiresArtistAndTrackMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		record string
+		field  string
+	}{
+		{
+			name:   "artist",
+			record: recordJSON("Track", "", "Album", "spotify:track:missing-artist"),
+			field:  "master_metadata_album_artist_name",
+		},
+		{
+			name:   "track",
+			record: recordJSON("", "Artist", "Album", "spotify:track:missing-track"),
+			field:  "master_metadata_track_name",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var plays []Play
+			var warnings []Warning
+			_, err := Ingest(context.Background(), []Input{{
+				Name:   "history.json",
+				Reader: strings.NewReader("[" + test.record + "]"),
+			}}, func(play Play) error {
+				plays = append(plays, play)
+				return nil
+			}, func(warning Warning) {
+				warnings = append(warnings, warning)
+			})
+			if err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if len(plays) != 0 {
+				t.Fatalf("plays = %#v; want no plays", plays)
+			}
+			if len(warnings) != 1 || warnings[0].Code != CodeMissingField ||
+				warnings[0].Field != test.field || warnings[0].Severity != "warning" {
+				t.Fatalf("warnings = %#v; want one missing-field warning for %q", warnings, test.field)
+			}
+		})
+	}
+}
+
 func TestIngestStreamsGenerated100000Records(t *testing.T) {
 	const total = 100_000
 	var input bytes.Buffer
