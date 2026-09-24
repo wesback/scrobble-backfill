@@ -1042,6 +1042,7 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	missing := make([]spotify.Play, 0)
 	matchedCount := 0
 	eligibleCount := 0
+	progress := observability.NewProgress(stdout)
 	summary, err := lastfm.Compare(
 		context.Background(),
 		dependencies.LastFMClient,
@@ -1053,15 +1054,29 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 			TimestampTolerance:    timestampTolerance,
 			TimestampToleranceSet: timestampToleranceSet,
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
+				deliveredRecords := 0
+				progressingConsume := func(play spotify.Play) error {
+					if err := consume(play); err != nil {
+						return err
+					}
+					deliveredRecords++
+					if deliveredRecords%1000 == 0 {
+						return progress.Update(deliveredRecords, 0, "records ingested")
+					}
+					return nil
+				}
 				var ingestErr error
-				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, consume, func(warning spotify.Warning) {
+				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, progressingConsume, func(warning spotify.Warning) {
 					fmt.Fprintf(stderr, "warning: %s: %s\n", warning.Code, warning.Reason)
 					events = append(events, journal.Event{
 						Type: "ingestion.warning", Timestamp: time.Now().UTC(),
 						Data: warningEventData(warning),
 					})
 				})
-				return ingestErr
+				if ingestErr != nil {
+					return ingestErr
+				}
+				return progress.Complete(fmt.Sprintf("progress complete: %d records ingested", deliveredRecords))
 			},
 		},
 		func(result lastfm.ComparisonResult) error {
