@@ -138,8 +138,43 @@ func Compare(
 	evaluator := NewEligibilityEvaluator(client, profile)
 	groupsByKey := make(map[string]*comparisonGroup)
 	groups := make([]*comparisonGroup, 0)
+	historyIndex := make(map[string][]*historyRecord)
 	seenHistory := make(map[string]struct{})
 	claimedHistory := make(map[string]int)
+	historyLoaded := false
+	historyOrder := 0
+	loadHistory := func() error {
+		if historyLoaded {
+			return nil
+		}
+		if err := ReadHistory(ctx, client, profile, start, end, func(scrobble Scrobble) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			identity := scrobbleIdentity(scrobble)
+			if _, seen := seenHistory[identity]; !seen {
+				seenHistory[identity] = struct{}{}
+				summary.LastFMScrobbles++
+			}
+			key := variantComparisonKey(scrobble.Artist, scrobble.Track)
+			historyIndex[key] = append(historyIndex[key], &historyRecord{
+				scrobble: scrobble,
+				identity: identity,
+				order:    historyOrder,
+			})
+			historyOrder++
+			return nil
+		}); err != nil {
+			return fmt.Errorf("Last.fm comparison: read history: %w", err)
+		}
+		for _, records := range historyIndex {
+			sort.SliceStable(records, func(i, j int) bool {
+				return records[i].scrobble.Timestamp.Before(records[j].scrobble.Timestamp)
+			})
+		}
+		historyLoaded = true
+		return nil
+	}
 	latestTimestamp := time.Time{}
 	flushGroup := func(group *comparisonGroup) error {
 		delete(groupsByKey, group.key)
@@ -149,7 +184,10 @@ func Compare(
 				break
 			}
 		}
-		return compareGroup(ctx, client, profile, start, end, tolerance, group, &summary, consumer, seenHistory, claimedHistory)
+		if err := loadHistory(); err != nil {
+			return err
+		}
+		return compareGroup(ctx, tolerance, group, historyIndex, &summary, consumer, claimedHistory)
 	}
 	flushStaleGroups := func(timestamp time.Time) error {
 		if latestTimestamp.IsZero() || timestamp.After(latestTimestamp) {
@@ -249,14 +287,11 @@ func comparisonGroupWindow(tolerance time.Duration) time.Duration {
 
 func compareGroup(
 	ctx context.Context,
-	client *Client,
-	profile AuthenticatedProfile,
-	start, end time.Time,
 	tolerance time.Duration,
 	group *comparisonGroup,
+	historyIndex map[string][]*historyRecord,
 	summary *ComparisonSummary,
 	consumer ComparisonConsumer,
-	seenHistory map[string]struct{},
 	claimedHistory map[string]int,
 ) error {
 	matcher := comparisonMatcher{
@@ -265,27 +300,29 @@ func compareGroup(
 		tolerance:       tolerance,
 	}
 	historyOccurrences := make(map[string]int)
-	if err := ReadHistory(ctx, client, profile, start, end, func(scrobble Scrobble) error {
+	records := historyIndex[group.key]
+	earliest := group.earliestTimestamp.Add(-tolerance)
+	latest := group.latestTimestamp.Add(tolerance)
+	first := sort.Search(len(records), func(index int) bool {
+		return !records[index].scrobble.Timestamp.Before(earliest)
+	})
+	last := sort.Search(len(records), func(index int) bool {
+		return records[index].scrobble.Timestamp.After(latest)
+	})
+	relevantRecords := append([]*historyRecord(nil), records[first:last]...)
+	sort.SliceStable(relevantRecords, func(i, j int) bool {
+		return relevantRecords[i].order < relevantRecords[j].order
+	})
+	for _, record := range relevantRecords {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		identity := scrobbleIdentity(scrobble)
-		if _, seen := seenHistory[identity]; !seen {
-			seenHistory[identity] = struct{}{}
-			summary.LastFMScrobbles++
+		occurrence := historyOccurrences[record.identity]
+		historyOccurrences[record.identity] = occurrence + 1
+		if occurrence < claimedHistory[record.identity] {
+			continue
 		}
-		occurrence := historyOccurrences[identity]
-		historyOccurrences[identity] = occurrence + 1
-		if occurrence < claimedHistory[identity] {
-			return nil
-		}
-		matcher.Assign(&historyRecord{
-			scrobble: scrobble,
-			identity: identity,
-		})
-		return nil
-	}); err != nil {
-		return fmt.Errorf("Last.fm comparison: read history: %w", err)
+		matcher.Assign(record)
 	}
 
 	sort.SliceStable(group.candidates, func(i, j int) bool {
@@ -388,6 +425,7 @@ type comparisonCandidate struct {
 type historyRecord struct {
 	scrobble Scrobble
 	identity string
+	order    int
 }
 
 type comparisonMatcher struct {

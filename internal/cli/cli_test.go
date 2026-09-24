@@ -925,7 +925,7 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 			if got := r.PostForm.Get("to"); got != fmt.Sprint(time.Date(2024, 1, 3, 0, 0, 0, 0, time.Local).UTC().Add(-time.Nanosecond).Unix()) {
 				t.Errorf("history to = %q, want inclusive local end", got)
 			}
-			if historyCalls <= 2 {
+			if historyCalls <= 1 {
 				fmt.Fprintf(w, `{"recenttracks":{"track":[{"artist":{"#text":"Artist"},"name":"Duplicate","date":{"uts":"%d"}}],"@attr":{"totalPages":"1"}}}`, base.Unix())
 				return
 			}
@@ -979,8 +979,8 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 	if !strings.Contains(stdout.String(), "Skipped duplicates: 2") || !strings.Contains(stdout.String(), "Nothing to submit.") {
 		t.Fatalf("second import output = %q, want fresh live comparison counts", stdout.String())
 	}
-	if historyCalls != 4 {
-		t.Fatalf("history calls = %d, want history retrieval during both live comparisons", historyCalls)
+	if historyCalls != 2 {
+		t.Fatalf("history calls = %d, want one history retrieval per live comparison", historyCalls)
 	}
 	if submissionCalls != 1 {
 		t.Fatalf("submission calls = %d, want only the first missing play submitted", submissionCalls)
@@ -1006,7 +1006,7 @@ func TestImportReconsidersIgnoredScrobblesWithoutResubmittingHistoryMatches(t *t
 		switch r.PostForm.Get("method") {
 		case "user.getRecentTracks":
 			historyRequests++
-			if historyRequests <= 2 {
+			if historyRequests <= 1 {
 				fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
 				return
 			}
@@ -1100,8 +1100,8 @@ func TestImportReconsidersIgnoredScrobblesWithoutResubmittingHistoryMatches(t *t
 		!reflect.DeepEqual(submitted[1], []string{"Ignored"}) {
 		t.Fatalf("submitted batches = %#v, want initial pair then only the ignored play", submitted)
 	}
-	if historyRequests != 4 {
-		t.Fatalf("history requests = %d, want each comparison group queried in both imports", historyRequests)
+	if historyRequests != 2 {
+		t.Fatalf("history requests = %d, want one history retrieval per import comparison", historyRequests)
 	}
 }
 
