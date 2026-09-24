@@ -13,7 +13,7 @@ Releases for Windows, macOS, and Linux. The current command set is:
 login       authenticate a Last.fm profile in the browser
 logout      remove the selected profile's saved session
 status      show whether the selected profile is logged in
-doctor      diagnose configuration, keyring, credentials, API, and journal
+doctor      diagnose configuration, credential tier and status, API, and journal
 analyse     read-only Spotify-to-Last.fm comparison
 import      compare and, unless dry-running, submit missing scrobbles
 verify      check journaled submissions against current Last.fm history
@@ -142,15 +142,30 @@ process environment and does not persist them; unset them when finished.
 ### Secure session credentials
 
 `login` obtains a Last.fm session after browser authorization and stores the
-session credential in the operating system's secure store:
+session credential in the selected credential tier. Rescrobble prefers the
+operating system's native secure store:
 
 - Windows Credential Manager
 - macOS Keychain
 - Linux Secret Service
 
-There is no plaintext-file or encrypted-file fallback. If the native keyring
-is unavailable, login and authenticated commands fail with an actionable
-error instead of weakening credential protection.
+On Linux only, if Secret Service is unavailable, Rescrobble selects an
+encrypted local file fallback. The fallback is weaker than a native keyring:
+a user with access to the same host account, or root, can derive its key. It
+is bound to the Linux machine identity and user, so copying its files to
+another machine does not make the credential portable. If the machine
+identity is lost or changes and the credential can no longer be decrypted,
+log in again to establish a usable credential.
+
+Credential tiers are selected when an operation runs; credentials are not
+automatically migrated when native-store availability changes. `login`
+establishes a credential in the tier currently selected, so explicitly log
+in again to establish a credential in a different tier. To return to native
+protection on Linux, make Secret Service available, then run `logout` and
+`login`: logout clears the selected profile's credential from both the
+native store and encrypted fallback, including a dormant credential in the
+other tier, and the subsequent login stores a fresh credential in Secret
+Service. On Windows and macOS, credentials always use the native store.
 
 ### Profiles
 
@@ -212,8 +227,8 @@ writing, then submit, then verify.
 
    `login` opens the official Last.fm authorization page in the default
    browser. Authorize the displayed token, return to the terminal, and press
-   Enter. A successful login stores the session in the native secure store.
-   `logout` removes the selected profile's stored session.
+   Enter. A successful login stores the session in the currently selected tier.
+   `logout` removes the selected profile's session from both Linux tiers.
 
 2. **Request and download Spotify data.** In Spotify's account privacy/data
    download flow, request **Extended Streaming History**. Spotify may provide
@@ -437,11 +452,19 @@ reported as a failed check. Select an existing profile with
 
 ### The keyring is unavailable
 
-Install or enable the operating system's native credential service and run
-`doctor` again. Linux requires a working Secret Service provider; macOS
-requires Keychain access; Windows requires Credential Manager. Rescrobble
-does not write session credentials to plaintext when these services are
-unavailable.
+`doctor` reports both native keyring availability and the selected credential
+tier. Linux uses its encrypted local fallback when Secret Service is
+unavailable; this is weaker than a native keyring, and a user with access to
+the same host account or root can derive its key. The fallback is bound to
+the Linux machine identity, so after that identity is lost and an existing
+credential cannot be decrypted, run `login` again.
+
+To restore native protection, install or enable the operating system's native
+credential service and run `logout` followed by `login`. Store availability
+changes do not migrate credentials automatically; `login` writes only to the
+tier selected at that time. `logout` clears the selected profile's credential
+from both Linux tiers. macOS requires Keychain access and Windows requires
+Credential Manager.
 
 ### Login or authenticated commands reject the session
 

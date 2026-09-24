@@ -300,6 +300,121 @@ func TestDoctorReportsEachFailedDiagnostic(t *testing.T) {
 	}
 }
 
+func TestDoctorReportsSelectedCredentialTierSeparatelyFromCredentialState(t *testing.T) {
+	const sessionSecret = "tier-test-session-secret"
+
+	tests := []struct {
+		name       string
+		native     *commandCredentialStore
+		fallback   *commandCredentialStore
+		wantOutput []string
+		wantExit   int
+	}{
+		{
+			name:   "native tier with credential",
+			native: &commandCredentialStore{sessions: map[string]string{"personal": sessionSecret}},
+			wantOutput: []string{
+				"PASS: credential storage tier: native OS credential store",
+				"PASS: credential presence and validity",
+				"PASS: secure keyring availability",
+			},
+		},
+		{
+			name: "native tier without credential",
+			native: &commandCredentialStore{
+				sessions: map[string]string{},
+			},
+			wantOutput: []string{
+				"PASS: credential storage tier: native OS credential store",
+				"FAIL: credential presence and validity: no stored credential; run login",
+				"PASS: secure keyring availability",
+			},
+			wantExit: 1,
+		},
+		{
+			name: "fallback tier with credential",
+			native: &commandCredentialStore{
+				loadErr: &credentials.UnavailableError{Cause: errors.New("Secret Service unavailable")},
+			},
+			fallback: &commandCredentialStore{sessions: map[string]string{"personal": sessionSecret}},
+			wantOutput: []string{
+				"PASS: credential storage tier: Linux encrypted local fallback",
+				"weaker than a native keyring",
+				"a user with access to the same host account or root can derive its key",
+				"FAIL: secure keyring availability",
+				"PASS: credential presence and validity",
+			},
+			wantExit: 1,
+		},
+		{
+			name: "fallback tier without credential",
+			native: &commandCredentialStore{
+				loadErr: &credentials.UnavailableError{Cause: errors.New("Secret Service unavailable")},
+			},
+			fallback: &commandCredentialStore{},
+			wantOutput: []string{
+				"PASS: credential storage tier: Linux encrypted local fallback",
+				"FAIL: credential presence and validity: no stored credential; run login",
+				"FAIL: secure keyring availability",
+			},
+			wantExit: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			configStore, journalStore := healthyDoctorStores(t, root)
+			store := credentials.NewPlatformStore("linux", test.native, test.fallback)
+			var stdout, stderr bytes.Buffer
+			exitCode := RunWithDependencies(
+				[]string{"doctor"},
+				&stdout,
+				&stderr,
+				Dependencies{
+					ConfigStore:     configStore,
+					CredentialStore: store,
+					LastFMClient:    healthyDoctorClient(t, `{"user":{"name":"alice"}}`),
+					JournalStore:    journalStore,
+				},
+			)
+			if exitCode != test.wantExit {
+				t.Fatalf("exit code = %d, want %d; stdout=%q stderr=%q", exitCode, test.wantExit, stdout.String(), stderr.String())
+			}
+			for _, want := range test.wantOutput {
+				if !strings.Contains(stdout.String(), want) {
+					t.Errorf("stdout = %q, want %q", stdout.String(), want)
+				}
+			}
+			if strings.Contains(stdout.String(), sessionSecret) || strings.Contains(stderr.String(), sessionSecret) {
+				t.Fatalf("diagnostic output exposes a session credential: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestHelpDocumentsCredentialTierPolicy(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies([]string{"--help"}, &stdout, &stderr, Dependencies{}); exitCode != 0 {
+		t.Fatalf("help exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	for _, want := range []string{
+		"Native credential storage is preferred",
+		"Linux uses an encrypted local fallback only when Secret Service is unavailable",
+		"machine-bound, not portable, and weaker",
+		"same-account users or root can derive its key",
+		"Store changes do not migrate credentials",
+		"login saves to the currently selected tier",
+		"Log in again to establish a credential in a different tier",
+		"After machine-identity loss, log in again",
+		"Logout clears credentials from both Linux tiers",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("help output = %q, want %q", stdout.String(), want)
+		}
+	}
+}
+
 func healthyDoctorStores(t *testing.T, root string) (config.Store, journal.Store) {
 	t.Helper()
 	configStore := config.NewFileStore(filepath.Join(root, "config.json"))

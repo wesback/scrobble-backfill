@@ -1367,6 +1367,84 @@ func TestLinuxUnavailableNativeStoreUsesFallbackForLoginStatusAndAuthenticatedRe
 	}
 }
 
+func TestLinuxLoginAfterLogoutStoresInRestoredNativeTier(t *testing.T) {
+	const (
+		apiKey    = "app-key"
+		apiSecret = "app-secret"
+	)
+	sessionNumber := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "auth.getToken":
+			fmt.Fprint(w, `{"token":"login-token"}`)
+		case "auth.getSession":
+			sessionNumber++
+			fmt.Fprintf(w, `{"session":{"name":"alice","key":"session-%d"}}`, sessionNumber)
+		default:
+			http.Error(w, "unexpected method", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	unavailable := &credentials.UnavailableError{Cause: errors.New("Secret Service is unavailable")}
+	native := &commandCredentialStore{loadErr: unavailable, saveErr: unavailable, deleteErr: unavailable}
+	fallback := &commandCredentialStore{}
+	store := credentials.NewPlatformStore("linux", native, fallback)
+	client := lastfm.NewClient(apiKey, apiSecret)
+	client.BaseURL = server.URL
+	client.OpenURL = func(string) error { return nil }
+	dependencies := Dependencies{
+		ConfigStore:     configStore,
+		CredentialStore: store,
+		LastFMClient:    client,
+		Input:           strings.NewReader("\n"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies([]string{"login"}, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("fallback login exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if got := fallback.sessions["personal"]; got != "session-1" {
+		t.Fatalf("fallback credential = %q, want session-1", got)
+	}
+
+	native.loadErr = nil
+	native.saveErr = nil
+	native.deleteErr = nil
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies([]string{"logout"}, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("logout exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if _, ok := fallback.sessions["personal"]; ok {
+		t.Fatal("logout retained the dormant fallback credential")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	dependencies.Input = strings.NewReader("\n")
+	if exitCode := RunWithDependencies([]string{"login"}, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("native login exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if got := native.sessions["personal"]; got != "session-2" {
+		t.Fatalf("native credential = %q, want session-2", got)
+	}
+	if _, ok := fallback.sessions["personal"]; ok {
+		t.Fatal("native login retained a fallback credential")
+	}
+}
+
 func TestLinuxLogoutClearsDormantFallbackProfileAndPreservesOthers(t *testing.T) {
 	configStore := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
 	if err := configStore.Save(config.Config{
