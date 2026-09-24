@@ -1253,6 +1253,162 @@ func TestStatusReportsSessionPresenceWithoutCredential(t *testing.T) {
 	}
 }
 
+func TestLinuxUnavailableNativeStoreUsesFallbackForLoginStatusAndAuthenticatedRequest(t *testing.T) {
+	const (
+		apiKey     = "app-key"
+		apiSecret  = "app-secret"
+		sessionKey = "work-session"
+	)
+	var receivedRequest url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "auth.getToken":
+			fmt.Fprint(w, `{"token":"login-token"}`)
+		case "auth.getSession":
+			fmt.Fprint(w, `{"session":{"name":"alice","key":"work-session"}}`)
+		case "user.getInfo":
+			receivedRequest = r.PostForm
+			fmt.Fprint(w, `{}`)
+		default:
+			http.Error(w, "unexpected method", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles: map[string]config.Profile{
+			"personal": {Name: "personal", LastFMUsername: "personal-user"},
+			"work":     {Name: "work"},
+		},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	unavailable := &credentials.UnavailableError{Cause: errors.New("Secret Service is unavailable")}
+	native := &commandCredentialStore{
+		loadErr: unavailable,
+		saveErr: unavailable,
+		hasErr:  unavailable,
+	}
+	file := &commandCredentialStore{sessions: map[string]string{"personal": "personal-session"}}
+	credentialStore := credentials.NewPlatformStore("linux", native, file)
+	client := lastfm.NewClient(apiKey, apiSecret)
+	client.BaseURL = server.URL
+	client.OpenURL = func(string) error { return nil }
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(
+		[]string{"--profile", "work", "login"},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: credentialStore,
+			LastFMClient:    client,
+			Input:           strings.NewReader("\n"),
+		},
+	); exitCode != 0 {
+		t.Fatalf("login exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if got := file.sessions["work"]; got != sessionKey {
+		t.Fatalf("fallback work credential = %q, want %q", got, sessionKey)
+	}
+	if got := file.sessions["personal"]; got != "personal-session" {
+		t.Fatalf("fallback personal credential = %q, want it unchanged", got)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies(
+		[]string{"--profile", "work", "status"},
+		&stdout,
+		&stderr,
+		Dependencies{ConfigStore: configStore, CredentialStore: credentialStore},
+	); exitCode != 0 {
+		t.Fatalf("status exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `profile "work": logged in`) {
+		t.Fatalf("status output = %q, want work profile logged in", stdout.String())
+	}
+
+	options, _, err := parseArgs([]string{"--profile", "work", "status"})
+	if err != nil {
+		t.Fatalf("parse selected profile: %v", err)
+	}
+	if _, err := callAuthenticated(
+		context.Background(),
+		options,
+		"user.getInfo",
+		nil,
+		Dependencies{ConfigStore: configStore, CredentialStore: credentialStore, LastFMClient: client},
+	); err != nil {
+		t.Fatalf("authenticated fallback request: %v", err)
+	}
+	if got := receivedRequest.Get("sk"); got != sessionKey {
+		t.Fatalf("authenticated request session key = %q, want %q", got, sessionKey)
+	}
+	if got := receivedRequest.Get("method"); got != "user.getInfo" {
+		t.Fatalf("authenticated request method = %q, want user.getInfo", got)
+	}
+	cfg, err := configStore.Load()
+	if err != nil {
+		t.Fatalf("load config after selected-profile login: %v", err)
+	}
+	if cfg.ActiveProfile != "personal" {
+		t.Fatalf("active profile after work login = %q, want personal", cfg.ActiveProfile)
+	}
+	if cfg.Profiles["work"].LastFMUsername != "alice" {
+		t.Fatalf("work Last.fm username = %q, want alice", cfg.Profiles["work"].LastFMUsername)
+	}
+}
+
+func TestLinuxLogoutClearsDormantFallbackProfileAndPreservesOthers(t *testing.T) {
+	configStore := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles: map[string]config.Profile{
+			"personal": {Name: "personal"},
+			"family":   {Name: "family"},
+		},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	native := &commandCredentialStore{sessions: map[string]string{
+		"personal": "native-personal",
+		"family":   "native-family",
+	}}
+	file := &commandCredentialStore{sessions: map[string]string{
+		"personal": "dormant-personal",
+		"family":   "dormant-family",
+	}}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(
+		[]string{"--profile", "personal", "logout"},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: credentials.NewPlatformStore("linux", native, file),
+		},
+	); exitCode != 0 {
+		t.Fatalf("logout exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	for tier, backend := range map[string]*commandCredentialStore{"native": native, "fallback": file} {
+		if _, ok := backend.sessions["personal"]; ok {
+			t.Errorf("%s store retained personal credential", tier)
+		}
+		if backend.sessions["family"] == "" {
+			t.Errorf("%s store deleted family credential", tier)
+		}
+	}
+}
+
 func TestLoginReportsActionableUnavailableSecureStore(t *testing.T) {
 	store := config.NewFileStore(filepath.Join(t.TempDir(), "config.json"))
 	secureStoreErr := &credentials.UnavailableError{Cause: errors.New("Secret Service is unavailable")}

@@ -24,7 +24,7 @@ var (
 	ErrCredentialNotFound = errors.New("Last.fm session credential not found")
 
 	// ErrSecureStoreUnavailable identifies a host where the OS credential
-	// service cannot be used. There is intentionally no file-backed fallback.
+	// service cannot be used.
 	ErrSecureStoreUnavailable = errors.New("secure credential store unavailable")
 )
 
@@ -78,11 +78,6 @@ func NewOSStore() *OSStore {
 
 // NewStore creates the production OS-native credential store.
 func NewStore() *OSStore {
-	return NewOSStore()
-}
-
-// NewDefaultStore creates the production OS-native credential store.
-func NewDefaultStore() *OSStore {
 	return NewOSStore()
 }
 
@@ -155,6 +150,74 @@ func (s *OSStore) Has(profile string) (bool, error) {
 		return false, unavailableError(err)
 	}
 	return true, nil
+}
+
+// NewPlatformStore selects the credential-store policy for platform.
+// Linux uses fallback for Save, Load, and Has only when the native operation
+// returns ErrSecureStoreUnavailable, while Delete always attempts both stores.
+// Other platforms always use native.
+func NewPlatformStore(platform string, native, fallback Store) Store {
+	if platform != "linux" || fallback == nil {
+		return native
+	}
+	return &linuxFallbackStore{native: native, fallback: fallback}
+}
+
+type linuxFallbackStore struct {
+	native   Store
+	fallback Store
+}
+
+func (s *linuxFallbackStore) Save(profile, session string) error {
+	if s == nil || s.native == nil {
+		return ErrSecureStoreUnavailable
+	}
+	err := s.native.Save(profile, session)
+	if !errors.Is(err, ErrSecureStoreUnavailable) {
+		return err
+	}
+	return s.fallback.Save(profile, session)
+}
+
+func (s *linuxFallbackStore) Load(profile string) (string, error) {
+	if s == nil || s.native == nil {
+		return "", ErrSecureStoreUnavailable
+	}
+	session, err := s.native.Load(profile)
+	if !errors.Is(err, ErrSecureStoreUnavailable) {
+		return session, err
+	}
+	return s.fallback.Load(profile)
+}
+
+func (s *linuxFallbackStore) Has(profile string) (bool, error) {
+	if s == nil || s.native == nil {
+		return false, ErrSecureStoreUnavailable
+	}
+	has, err := s.native.Has(profile)
+	if !errors.Is(err, ErrSecureStoreUnavailable) {
+		return has, err
+	}
+	return s.fallback.Has(profile)
+}
+
+// Delete always attempts both stores so dormant file credentials cannot
+// reappear after native-store availability changes.
+func (s *linuxFallbackStore) Delete(profile string) error {
+	if s == nil {
+		return ErrSecureStoreUnavailable
+	}
+	var nativeErr error
+	if s.native == nil {
+		nativeErr = ErrSecureStoreUnavailable
+	} else {
+		nativeErr = s.native.Delete(profile)
+	}
+	var fallbackErr error
+	if s.fallback != nil {
+		fallbackErr = s.fallback.Delete(profile)
+	}
+	return errors.Join(nativeErr, fallbackErr)
 }
 
 // UnavailableError reports that the secure operating system credential

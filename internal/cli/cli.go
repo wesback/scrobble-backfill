@@ -38,9 +38,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 // It is useful for embedding and keeps command behavior independently
 // testable without changing the user's configuration.
 func RunWithStore(args []string, stdout, stderr io.Writer, store config.Store) int {
+	credentialStore, err := credentials.NewDefaultStore()
+	if err != nil {
+		fmt.Fprintf(stderr, "error: initialize credential store: %v\n", err)
+		return 1
+	}
 	return RunWithDependencies(args, stdout, stderr, Dependencies{
 		ConfigStore:     store,
-		CredentialStore: credentials.NewDefaultStore(),
+		CredentialStore: credentialStore,
 		LastFMClient:    lastfm.NewClientFromEnv(),
 		Input:           os.Stdin,
 	})
