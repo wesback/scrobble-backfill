@@ -1141,6 +1141,9 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	submissionOptions := dependencies.Submission
 	submissionOptions.BaselineDelay = submissionDelay
 	submissionOptions.BaselineDelaySet = true
+	submissionOptions.Progress = func(completed, total int) error {
+		return progress.Update(completed, total, "batches submitted")
+	}
 	service := lastfm.NewSubmissionService(dependencies.LastFMClient, store, submissionOptions)
 	authenticated := lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey}
 	if options.dryRun {
@@ -1176,6 +1179,10 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 			}
 		}
 		return failImport(fmt.Errorf("submit import batches: %w", err))
+	}
+	totalBatches := (len(missing) + lastfm.MaxSubmissionBatchSize - 1) / lastfm.MaxSubmissionBatchSize
+	if err := progress.Complete(fmt.Sprintf("progress complete: %d batches submitted", totalBatches)); err != nil {
+		return failImport(fmt.Errorf("complete import submission progress: %w", err))
 	}
 	currentRun, openErr := store.OpenRun(profileName, invocationID)
 	if openErr != nil {

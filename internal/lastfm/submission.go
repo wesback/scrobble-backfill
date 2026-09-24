@@ -35,7 +35,11 @@ var (
 // tests can provide a fake clock without changing production behavior.
 type SubmissionSleeper func(context.Context, time.Duration) error
 
-// SubmissionOptions controls pacing and retry behavior.
+// SubmissionProgress reports the number of submitted batches and the total
+// batch count. It is called only after a batch is marked submitted.
+type SubmissionProgress func(completed, total int) error
+
+// SubmissionOptions controls pacing, retries, and progress reporting.
 type SubmissionOptions struct {
 	// BaselineDelay is used between ordinary batch requests and as the first
 	// retry delay. Zero selects DefaultSubmissionDelay.
@@ -48,6 +52,9 @@ type SubmissionOptions struct {
 	MaxRetries int
 	// Sleep replaces the real timer in tests. Nil uses a context-aware timer.
 	Sleep SubmissionSleeper
+	// Progress is called after each batch is successfully marked submitted.
+	// Nil disables submission progress reporting.
+	Progress SubmissionProgress
 }
 
 // SubmissionService is the durable Last.fm write boundary. It owns request
@@ -113,7 +120,8 @@ func (s *SubmissionService) Submit(
 		}
 	}
 
-	previousRequest := len(resume.Submitted) > 0
+	completed := len(resume.Submitted)
+	previousRequest := completed > 0
 	for index := 0; index < len(batches); index++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -145,6 +153,12 @@ func (s *SubmissionService) Submit(
 		}
 		if err := s.journal.MarkSubmitted(run.Profile, run.InvocationID, batch.Sequence); err != nil {
 			return fmt.Errorf("mark Last.fm submission batch %d submitted: %w", batch.Sequence, err)
+		}
+		completed++
+		if s.options.Progress != nil {
+			if err := s.options.Progress(completed, len(batches)); err != nil {
+				return fmt.Errorf("report Last.fm submission progress after batch %d: %w", batch.Sequence, err)
+			}
 		}
 		previousRequest = true
 	}
