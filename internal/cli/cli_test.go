@@ -161,6 +161,156 @@ func TestLogLevelOptionRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
+func TestAnalyseReportsIngestionProgressBeforeSummary(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeGeneratedSpotifyAnalysisExport(t, exportPath, 2500)
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"analyse", "--from", "2024-01-02", "--to", "2024-01-02", exportPath},
+		&stdout,
+		&stderr,
+		newAnalyseTestDependencies(t, root),
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	summaryIndex := indexOfLinePrefix(lines, "Analysis summary for profile")
+	if summaryIndex < 0 {
+		t.Fatalf("stdout = %q, want analysis summary", stdout.String())
+	}
+
+	var updateCounts []int
+	lastUpdateIndex := -1
+	for index, line := range lines[:summaryIndex] {
+		var count, total int
+		if _, err := fmt.Sscanf(line, "progress: %d/%d", &count, &total); err == nil {
+			updateCounts = append(updateCounts, count)
+			lastUpdateIndex = index
+		}
+	}
+	if !reflect.DeepEqual(updateCounts, []int{1000, 2000}) {
+		t.Fatalf("progress update counts = %v, want [1000 2000] before summary; stdout = %q",
+			updateCounts, stdout.String())
+	}
+	completionIndex := indexOfLinePrefix(lines, "progress complete:")
+	if completionIndex <= lastUpdateIndex || completionIndex >= summaryIndex {
+		t.Fatalf("completion line index = %d, last update index = %d, summary index = %d; stdout = %q",
+			completionIndex, lastUpdateIndex, summaryIndex, stdout.String())
+	}
+	if !strings.Contains(lines[completionIndex], "2500 records ingested") {
+		t.Fatalf("completion line = %q, want final count of 2500 records", lines[completionIndex])
+	}
+}
+
+func TestAnalyseReportsCompletionWithoutPeriodicProgressForSmallExport(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeGeneratedSpotifyAnalysisExport(t, exportPath, 3)
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"analyse", "--from", "2024-01-02", "--to", "2024-01-02", exportPath},
+		&stdout,
+		&stderr,
+		newAnalyseTestDependencies(t, root),
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	summaryIndex := indexOfLinePrefix(lines, "Analysis summary for profile")
+	if summaryIndex < 0 {
+		t.Fatalf("stdout = %q, want analysis summary", stdout.String())
+	}
+	progressLines := make([]string, 0, 1)
+	for _, line := range lines[:summaryIndex] {
+		if strings.Contains(line, "progress") {
+			progressLines = append(progressLines, line)
+		}
+	}
+	if len(progressLines) != 1 || !strings.HasPrefix(progressLines[0], "progress complete:") {
+		t.Fatalf("progress lines before summary = %q, want only the final completion message; stdout = %q",
+			progressLines, stdout.String())
+	}
+	if !strings.Contains(progressLines[0], "3 records ingested") {
+		t.Fatalf("completion line = %q, want final count of 3 records", progressLines[0])
+	}
+}
+
+func TestAnalysePreservesIngestionErrorHandling(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "corrupt.zip")
+	if err := os.WriteFile(exportPath, []byte("not a zip archive"), 0o600); err != nil {
+		t.Fatalf("write corrupt archive: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"analyse", "--from", "2024-01-02", "--to", "2024-01-02", exportPath},
+		&stdout,
+		&stderr,
+		newAnalyseTestDependencies(t, root),
+	)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "error: analyse: ") {
+		t.Fatalf("stderr = %q, want existing analyse error prefix", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Analysis summary for profile") {
+		t.Fatalf("stdout = %q, unexpected analysis summary after ingestion error", stdout.String())
+	}
+}
+
+func newAnalyseTestDependencies(t *testing.T, root string) Dependencies {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+	}))
+	t.Cleanup(server.Close)
+
+	store := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := store.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	return Dependencies{
+		ConfigStore:     store,
+		CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+		LastFMClient:    client,
+	}
+}
+
+func writeGeneratedSpotifyAnalysisExport(t *testing.T, path string, count int) {
+	t.Helper()
+	records := make([]string, count)
+	for index := range records {
+		records[index] = fmt.Sprintf(
+			`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Track %04d","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:track-%04d"}`,
+			index, index,
+		)
+	}
+	writeSpotifyAnalysisExport(t, path, records...)
+}
+
+func indexOfLinePrefix(lines []string, prefix string) int {
+	for index, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			return index
+		}
+	}
+	return -1
+}
+
 func TestAnalyseUsesPersistedTimestampToleranceAndPreservesItWhenOverridden(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "history.json")
