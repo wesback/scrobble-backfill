@@ -63,6 +63,30 @@ func TestProgressUsesPlainLinesForNonTerminalWriter(t *testing.T) {
 	}
 }
 
+func TestProgressRendersKnownTotalForNonTerminalWriter(t *testing.T) {
+	writer := &fakeProgressWriter{}
+	progress := NewProgress(writer)
+	if err := progress.Update(3, 5, "items"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if got := writer.String(); got != "progress: 3/5 items\n" {
+		t.Fatalf("output = %q, want %q", got, "progress: 3/5 items\n")
+	}
+}
+
+func TestProgressRendersUnknownTotalForNonTerminalWriter(t *testing.T) {
+	writer := &fakeProgressWriter{}
+	progress := NewProgress(writer)
+	if err := progress.Update(1000, 0, "records ingested"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if got := strings.TrimSuffix(writer.String(), "\n"); got != "progress: 1000/unknown records ingested" {
+		t.Fatalf("output = %q, want %q", got, "progress: 1000/unknown records ingested")
+	}
+}
+
 func TestProgressRemovesControlCharactersForNonTerminalWriter(t *testing.T) {
 	writer := &fakeProgressWriter{}
 	progress := NewProgress(writer)

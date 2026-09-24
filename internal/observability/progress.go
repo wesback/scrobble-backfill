@@ -50,7 +50,7 @@ func (p *Progress) IsTerminal() bool {
 	return p.terminal
 }
 
-// Update renders one progress state.
+// Update renders one progress state; a total of zero is shown as unknown.
 func (p *Progress) Update(completed, total int, detail string) error {
 	if p == nil {
 		return errors.New("progress is nil")
@@ -59,7 +59,12 @@ func (p *Progress) Update(completed, total int, detail string) error {
 		return errors.New("progress counts must not be negative")
 	}
 
-	line := fmt.Sprintf("progress: %d/%d", completed, total)
+	var line string
+	if total == 0 {
+		line = fmt.Sprintf("progress: %d/unknown", completed)
+	} else {
+		line = fmt.Sprintf("progress: %d/%d", completed, total)
+	}
 	if detail = strings.TrimSpace(sanitizeText(detail)); detail != "" {
 		line += " " + detail
 	}
