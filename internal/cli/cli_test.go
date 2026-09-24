@@ -242,6 +242,80 @@ func TestAnalyseReportsCompletionWithoutPeriodicProgressForSmallExport(t *testin
 	}
 }
 
+func TestImportDryRunReportsIngestionProgressBeforeSummary(t *testing.T) {
+	stdout := runImportWithGeneratedSpotifyExport(t, 2500)
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	summaryIndex := indexOfLinePrefix(lines, "Import summary for profile")
+	if summaryIndex < 0 {
+		t.Fatalf("stdout = %q, want import summary", stdout)
+	}
+
+	var updateCounts []int
+	lastUpdateIndex := -1
+	for index, line := range lines[:summaryIndex] {
+		var count, total int
+		if _, err := fmt.Sscanf(line, "progress: %d/%d", &count, &total); err == nil {
+			updateCounts = append(updateCounts, count)
+			lastUpdateIndex = index
+		}
+	}
+	if !reflect.DeepEqual(updateCounts, []int{1000, 2000}) {
+		t.Fatalf("progress update counts = %v, want [1000 2000] before summary; stdout = %q",
+			updateCounts, stdout)
+	}
+	completionIndex := indexOfLinePrefix(lines, "progress complete:")
+	if completionIndex <= lastUpdateIndex || completionIndex >= summaryIndex {
+		t.Fatalf("completion line index = %d, last update index = %d, summary index = %d; stdout = %q",
+			completionIndex, lastUpdateIndex, summaryIndex, stdout)
+	}
+	if !strings.Contains(lines[completionIndex], "2500 records ingested") {
+		t.Fatalf("completion line = %q, want final count of 2500 records", lines[completionIndex])
+	}
+}
+
+func TestImportDryRunReportsOnlyCompletionForSmallExport(t *testing.T) {
+	stdout := runImportWithGeneratedSpotifyExport(t, 3)
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	summaryIndex := indexOfLinePrefix(lines, "Import summary for profile")
+	if summaryIndex < 0 {
+		t.Fatalf("stdout = %q, want import summary", stdout)
+	}
+	progressLines := make([]string, 0, 1)
+	for _, line := range lines[:summaryIndex] {
+		if strings.Contains(line, "progress") {
+			progressLines = append(progressLines, line)
+		}
+	}
+	if len(progressLines) != 1 || !strings.HasPrefix(progressLines[0], "progress complete:") {
+		t.Fatalf("progress lines before summary = %q, want only the final completion message; stdout = %q",
+			progressLines, stdout)
+	}
+	if !strings.Contains(progressLines[0], "3 records ingested") {
+		t.Fatalf("completion line = %q, want final count of 3 records", progressLines[0])
+	}
+}
+
+func runImportWithGeneratedSpotifyExport(t *testing.T, count int) string {
+	t.Helper()
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeGeneratedSpotifyAnalysisExport(t, exportPath, count)
+
+	var stdout, stderr bytes.Buffer
+	dependencies := newAnalyseTestDependencies(t, root)
+	dependencies.JournalStore = journal.NewFileStore(filepath.Join(root, "journal"))
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--dry-run", exportPath},
+		&stdout,
+		&stderr,
+		dependencies,
+	)
+	if exitCode != 0 {
+		t.Fatalf("dry-run exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	return stdout.String()
+}
+
 func TestAnalysePreservesIngestionErrorHandling(t *testing.T) {
 	root := t.TempDir()
 	exportPath := filepath.Join(root, "corrupt.zip")
