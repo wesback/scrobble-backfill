@@ -60,6 +60,9 @@ type ComparisonRequest struct {
 	// tolerance from an omitted tolerance, which uses the default.
 	TimestampToleranceSet bool
 	Plays                 PlaySource
+	// DurationLookupFailureHandler reports duration lookup failures after
+	// retries are exhausted. Nil disables the warning.
+	DurationLookupFailureHandler EligibilityLookupFailureHandler
 }
 
 // ComparisonResult is the decision for one eligible Spotify play. A
@@ -135,7 +138,9 @@ func Compare(
 		TimestampTolerance: tolerance,
 		ExcludedByReason:   make(map[string]int),
 	}
-	evaluator := NewEligibilityEvaluator(client, profile)
+	evaluator := NewEligibilityEvaluator(client, profile, EligibilityOptions{
+		LookupFailureHandler: request.DurationLookupFailureHandler,
+	})
 	groupsByKey := make(map[string]*comparisonGroup)
 	groups := make([]*comparisonGroup, 0)
 	historyIndex := make(map[string][]*historyRecord)
