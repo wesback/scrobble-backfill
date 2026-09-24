@@ -92,8 +92,19 @@ directory containing the binary.
 ### Configure Last.fm API access
 
 Rescrobble uses a Last.fm API application key and secret for API requests.
-Create or retrieve them from the Last.fm API account/application settings,
-then set both environment variables in the shell that will run Rescrobble:
+Create a new application at <https://www.last.fm/api/account/create>, or
+view and manage existing applications at <https://www.last.fm/api/accounts>.
+Each application's page shows two separate 32-character values: an API key
+and a Shared secret. Both are required, and the API key is easy to overlook
+because it is not visually distinct from the secret.
+
+The Callback URL field on that page has no effect on Rescrobble. Rescrobble
+uses Last.fm's desktop application flow (`auth.getToken`, authorization on
+the Last.fm site, then `auth.getSession`), not the web application flow that
+relies on a callback redirect, so you can leave the field blank or enter any
+placeholder value.
+
+Set both environment variables in the shell that will run Rescrobble:
 
 macOS and Linux:
 
