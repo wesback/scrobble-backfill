@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wesback/scrobble-backfill/internal/config"
 )
 
 // AuthenticatedProfile is the resolved Last.fm identity and session used by
@@ -28,14 +30,48 @@ type Scrobble struct {
 // history retrieval.
 type HistoryConsumer func(Scrobble) error
 
+const (
+	// DefaultHistoryDelay is the baseline delay between retry attempts.
+	DefaultHistoryDelay = config.DefaultBatchDelay
+
+	// DefaultHistoryMaxRetries is the number of retries after the initial
+	// page request.
+	DefaultHistoryMaxRetries = 3
+)
+
+// HistorySleeper waits before retrying a history page request. It is a
+// function so tests can provide a fake clock without changing production
+// behavior.
+type HistorySleeper func(context.Context, time.Duration) error
+
+// HistoryOptions controls retry behavior for history page requests.
+type HistoryOptions struct {
+	// BaselineDelay is the first retry delay. Zero selects
+	// DefaultHistoryDelay unless BaselineDelaySet is true.
+	BaselineDelay time.Duration
+	// BaselineDelaySet distinguishes an explicitly selected zero delay from
+	// an omitted delay, which uses DefaultHistoryDelay.
+	BaselineDelaySet bool
+	// MaxRetries is the number of retries after the initial request. Zero
+	// selects DefaultHistoryMaxRetries.
+	MaxRetries int
+	// Sleep replaces the real timer in tests. Nil uses a context-aware timer.
+	Sleep HistorySleeper
+}
+
 // HistoryReader reads a profile's bounded Last.fm history through Client.
 type HistoryReader struct {
-	client *Client
+	client  *Client
+	options HistoryOptions
 }
 
 // NewHistoryReader creates a history reader backed by client.
-func NewHistoryReader(client *Client) *HistoryReader {
-	return &HistoryReader{client: client}
+func NewHistoryReader(client *Client, options ...HistoryOptions) *HistoryReader {
+	selected := HistoryOptions{}
+	if len(options) > 0 {
+		selected = options[0]
+	}
+	return &HistoryReader{client: client, options: normalizeHistoryOptions(selected)}
 }
 
 // ReadHistory streams dated scrobbles for profile in the inclusive interval
@@ -92,14 +128,25 @@ func (r *HistoryReader) Read(
 	}
 
 	for page := 1; ; page++ {
-		payload, err := r.client.Call(ctx, "user.getRecentTracks", map[string]string{
-			"user": profile.Username,
-			"from": strconv.FormatInt(start.Unix(), 10),
-			"to":   strconv.FormatInt(end.Unix(), 10),
-			"page": strconv.Itoa(page),
-		}, profile.SessionKey)
-		if err != nil {
-			return historyRequestError(page, profile.SessionKey, err)
+		var payload map[string]any
+		for attempt := 0; ; attempt++ {
+			var err error
+			payload, err = r.client.Call(ctx, "user.getRecentTracks", map[string]string{
+				"user": profile.Username,
+				"from": strconv.FormatInt(start.Unix(), 10),
+				"to":   strconv.FormatInt(end.Unix(), 10),
+				"page": strconv.Itoa(page),
+			}, profile.SessionKey)
+			if err == nil {
+				break
+			}
+			if !retryableSubmissionError(err) || attempt >= r.options.MaxRetries {
+				return historyRequestError(page, profile.SessionKey, err)
+			}
+			delay := retryDelay(r.options.BaselineDelay, attempt)
+			if err := r.wait(ctx, delay); err != nil {
+				return fmt.Errorf("wait to retry Last.fm history page %d: %w", page, err)
+			}
 		}
 
 		tracks, totalPages, err := parseHistoryPage(payload)
@@ -118,6 +165,35 @@ func (r *HistoryReader) Read(
 			return nil
 		}
 	}
+}
+
+func (r *HistoryReader) wait(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.options.Sleep(ctx, delay)
+}
+
+func normalizeHistoryOptions(options HistoryOptions) HistoryOptions {
+	if options.BaselineDelay == 0 && !options.BaselineDelaySet {
+		options.BaselineDelay = DefaultHistoryDelay
+	}
+	if options.BaselineDelay < 0 {
+		options.BaselineDelay = 0
+	}
+	if options.MaxRetries == 0 {
+		options.MaxRetries = DefaultHistoryMaxRetries
+	}
+	if options.MaxRetries < 0 {
+		options.MaxRetries = 0
+	}
+	if options.Sleep == nil {
+		options.Sleep = sleepWithContext
+	}
+	return options
 }
 
 func historyRequestError(page int, sessionKey string, err error) error {
