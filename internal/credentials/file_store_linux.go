@@ -31,6 +31,8 @@ const (
 	linuxCredentialKeySize   = 32
 )
 
+var errLinuxMachineIdentityUnavailable = errors.New("Linux machine identity unavailable")
+
 // LinuxFileStore stores encrypted credentials in separate owner-only files.
 // Its key is derived from an owner-only random secret and bound to the Linux
 // machine identity and the owning user.
@@ -239,6 +241,9 @@ func (s *LinuxFileStore) decrypt(profile string, data []byte) ([]byte, error) {
 	}
 	encryptionKey, verificationKey, err := s.derivedKeys()
 	if err != nil {
+		if errors.Is(err, errLinuxMachineIdentityUnavailable) {
+			return nil, ErrCredentialNotFound
+		}
 		return nil, err
 	}
 	expectedCheck := credentialKeyCheck(verificationKey, profile)
@@ -271,14 +276,17 @@ func (s *LinuxFileStore) derivedKeys() ([]byte, []byte, error) {
 	}
 	machineID, err := s.machineIdentity()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read machine identity: %w", err)
+		return nil, nil, fmt.Errorf("%w: %w", errLinuxMachineIdentityUnavailable, err)
+	}
+	if machineID == "" {
+		return nil, nil, errLinuxMachineIdentityUnavailable
 	}
 	userID, err := s.owningUserID()
 	if err != nil {
 		return nil, nil, fmt.Errorf("read owning Linux user identity: %w", err)
 	}
-	if machineID == "" || userID == "" {
-		return nil, nil, errors.New("machine and user identities must not be empty")
+	if userID == "" {
+		return nil, nil, errors.New("owning Linux user identity must not be empty")
 	}
 	secret, err := s.loadOrCreateSecret()
 	if err != nil {

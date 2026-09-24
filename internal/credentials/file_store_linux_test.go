@@ -129,6 +129,21 @@ func TestLinuxFileStoreMachineIdentityChangeIsNotFound(t *testing.T) {
 	}
 }
 
+func TestLinuxFileStoreMachineIdentityLossRequiresLogin(t *testing.T) {
+	store := newTestLinuxFileStore(filepath.Join(t.TempDir(), "credentials"), "machine-a")
+	if err := store.Save("personal", "session-secret"); err != nil {
+		t.Fatalf("save credential: %v", err)
+	}
+	store.machineIdentity = func() (string, error) { return "", errors.New("machine identity file missing") }
+
+	if _, err := store.Load("personal"); !errors.Is(err, ErrCredentialNotFound) {
+		t.Fatalf("load credential without machine identity error = %v, want ErrCredentialNotFound", err)
+	}
+	if has, err := store.Has("personal"); err != nil || has {
+		t.Fatalf("Has(personal) without machine identity = %t, %v; want false, nil", has, err)
+	}
+}
+
 func TestLinuxFileStoreCopiedCredentialCannotBeDecryptedWithoutKeyFile(t *testing.T) {
 	sourceRoot := filepath.Join(t.TempDir(), "source")
 	source := newTestLinuxFileStore(sourceRoot, "machine-a")
@@ -274,6 +289,54 @@ func TestLinuxDefaultCredentialPathIsUnderUserConfigDir(t *testing.T) {
 	want := filepath.Join(configDir, "rescrobble", "credentials")
 	if path != want {
 		t.Fatalf("Linux default path = %q, want %q", path, want)
+	}
+}
+
+func TestLinuxDefaultCredentialStoreUsesNativeFirstFallback(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+
+	store, err := NewDefaultStore()
+	if err != nil {
+		t.Fatalf("create default credential store: %v", err)
+	}
+	selected, ok := store.(*linuxFallbackStore)
+	if !ok {
+		t.Fatalf("default credential store type = %T, want Linux fallback policy", store)
+	}
+	if _, ok := selected.native.(*OSStore); !ok {
+		t.Errorf("native credential store type = %T, want *OSStore", selected.native)
+	}
+	fallback, ok := selected.fallback.(*LinuxFileStore)
+	if !ok {
+		t.Fatalf("fallback credential store type = %T, want *LinuxFileStore", selected.fallback)
+	}
+	wantRoot := filepath.Join(configDir, "rescrobble", linuxCredentialDirectory)
+	if fallback.Root != wantRoot {
+		t.Errorf("fallback root = %q, want %q", fallback.Root, wantRoot)
+	}
+}
+
+func TestLinuxDefaultStoreInitializationSurvivesFallbackPathError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "")
+
+	store, err := NewDefaultStore()
+	if err != nil {
+		t.Fatalf("initialize default store without fallback path: %v", err)
+	}
+	selected, ok := store.(*linuxFallbackStore)
+	if !ok {
+		t.Fatalf("default credential store type = %T, want Linux fallback policy", store)
+	}
+	if _, ok := selected.native.(*OSStore); !ok {
+		t.Fatalf("native credential store type = %T, want *OSStore", selected.native)
+	}
+	if _, ok := selected.fallback.(*linuxFallbackInitializationError); !ok {
+		t.Fatalf("fallback credential store type = %T, want deferred initialization error", selected.fallback)
+	}
+	if err := selected.fallback.Save("personal", "session"); err == nil {
+		t.Fatal("fallback Save succeeded without a configured credential path")
 	}
 }
 
