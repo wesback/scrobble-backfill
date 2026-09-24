@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,151 @@ func TestSubmissionBatchesAtFiftyAndResumesWithoutRedispatchingSubmittedBatch(t 
 	}
 	if len(final.Submitted) != 2 || len(final.Pending) != 0 {
 		t.Fatalf("final journal state = submitted %#v pending %#v, want two submitted batches", final.Submitted, final.Pending)
+	}
+}
+
+func TestSubmissionReportsProgressAfterEachBatchIsMarkedSubmitted(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-progress")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := make([]journal.Submission, 101)
+	for index := range plays {
+		plays[index] = journal.Submission{
+			Artist:    "Artist",
+			Track:     fmt.Sprintf("Track %03d", index),
+			Timestamp: time.Unix(int64(index+1), 0),
+		}
+	}
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		if method := r.PostForm.Get("method"); method != "track.scrobble" {
+			t.Errorf("method = %q, want track.scrobble", method)
+		}
+		requests++
+		fmt.Fprint(w, `{}`)
+	}))
+	defer server.Close()
+
+	type progressUpdate struct {
+		completed int
+		total     int
+	}
+	var updates []progressUpdate
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{
+		BaselineDelay:    0,
+		BaselineDelaySet: true,
+		Progress: func(completed, total int) error {
+			resume, err := store.Resume(run.Profile, run.InvocationID)
+			if err != nil {
+				return fmt.Errorf("read journal during progress callback: %w", err)
+			}
+			if len(resume.Submitted) != completed {
+				return fmt.Errorf("journal has %d submitted batches at progress %d", len(resume.Submitted), completed)
+			}
+			updates = append(updates, progressUpdate{completed: completed, total: total})
+			return nil
+		},
+	})
+	if err := service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	want := []progressUpdate{{1, 3}, {2, 3}, {3, 3}}
+	if !reflect.DeepEqual(updates, want) {
+		t.Fatalf("progress updates = %#v, want %#v", updates, want)
+	}
+	if requests != 3 {
+		t.Fatalf("submission requests = %d, want 3", requests)
+	}
+}
+
+func TestSubmissionReportsOnlySuccessfulBatchesBeforeFailure(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-partial-progress")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := make([]journal.Submission, 151)
+	for index := range plays {
+		plays[index] = journal.Submission{
+			Artist:    "Artist",
+			Track:     fmt.Sprintf("Track %03d", index),
+			Timestamp: time.Unix(int64(index+1), 0),
+		}
+	}
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		if method := r.PostForm.Get("method"); method != "track.scrobble" {
+			t.Errorf("method = %q, want track.scrobble", method)
+		}
+		requests++
+		if requests <= 2 {
+			fmt.Fprint(w, `{}`)
+			return
+		}
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	type progressUpdate struct {
+		completed int
+		total     int
+	}
+	var updates []progressUpdate
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{
+		BaselineDelay: 0,
+		MaxRetries:    1,
+		Sleep:         func(context.Context, time.Duration) error { return nil },
+		Progress: func(completed, total int) error {
+			resume, err := store.Resume(run.Profile, run.InvocationID)
+			if err != nil {
+				return fmt.Errorf("read journal during progress callback: %w", err)
+			}
+			if len(resume.Submitted) != completed {
+				return fmt.Errorf("journal has %d submitted batches at progress %d", len(resume.Submitted), completed)
+			}
+			updates = append(updates, progressUpdate{completed: completed, total: total})
+			return nil
+		},
+	})
+	err = service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays)
+	if err == nil {
+		t.Fatal("expected third batch submission to fail")
+	}
+
+	want := []progressUpdate{{1, 4}, {2, 4}}
+	if !reflect.DeepEqual(updates, want) {
+		t.Fatalf("progress updates = %#v, want %#v", updates, want)
+	}
+	if requests != 4 {
+		t.Fatalf("submission requests = %d, want two successful requests and two failed attempts", requests)
+	}
+	resume, err := store.Resume(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("resume partially submitted run: %v", err)
+	}
+	if len(resume.Submitted) != 2 || len(resume.Pending) != 1 || resume.Pending[0].State != journal.StatePlanned {
+		t.Fatalf("journal after failed batch = %#v, want two submitted batches and one planned", resume)
 	}
 }
 

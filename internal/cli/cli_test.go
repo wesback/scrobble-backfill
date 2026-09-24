@@ -295,6 +295,160 @@ func TestImportDryRunReportsOnlyCompletionForSmallExport(t *testing.T) {
 	}
 }
 
+func TestImportReportsSubmissionBatchProgressBeforeFinalTotal(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeGeneratedSpotifyAnalysisExport(t, exportPath, 101)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	dependencies := newAnalyseTestDependencies(t, root)
+	dependencies.LastFMClient.BaseURL = server.URL
+	dependencies.JournalStore = journal.NewFileStore(filepath.Join(root, "journal"))
+	dependencies.Submission = lastfm.SubmissionOptions{BaselineDelay: 0}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--batch-delay", "0s", "--yes", exportPath},
+		&stdout,
+		&stderr,
+		dependencies,
+	)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	finalIndex := indexOfLinePrefix(lines, "Submitted 101 missing plays.")
+	if finalIndex < 0 {
+		t.Fatalf("stdout = %q, want final submitted total", stdout.String())
+	}
+	var progressLines []string
+	for index, line := range lines {
+		if strings.Contains(line, "batches submitted") {
+			if index >= finalIndex {
+				t.Fatalf("progress line %q appeared after final total; stdout = %q", line, stdout.String())
+			}
+			progressLines = append(progressLines, line)
+		}
+	}
+	want := []string{
+		"progress: 1/3 batches submitted",
+		"progress: 2/3 batches submitted",
+		"progress: 3/3 batches submitted",
+		"progress complete: 3 batches submitted",
+	}
+	if !reflect.DeepEqual(progressLines, want) {
+		t.Fatalf("submission progress lines = %q, want %q; stdout = %q",
+			progressLines, want, stdout.String())
+	}
+}
+
+func TestImportReportsOnlySuccessfulSubmissionProgressOnPartialFailure(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	writeGeneratedSpotifyAnalysisExport(t, exportPath, 101)
+
+	var submissionRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			submissionRequests++
+			if submissionRequests == 1 {
+				fmt.Fprint(w, `{}`)
+				return
+			}
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	dependencies := newAnalyseTestDependencies(t, root)
+	dependencies.LastFMClient.BaseURL = server.URL
+	dependencies.JournalStore = journal.NewFileStore(filepath.Join(root, "journal"))
+	dependencies.Submission = lastfm.SubmissionOptions{
+		BaselineDelay: 0,
+		MaxRetries:    1,
+		Sleep:         func(context.Context, time.Duration) error { return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2024-01-02", "--to", "2024-01-02", "--batch-delay", "0s", "--yes", exportPath},
+		&stdout,
+		&stderr,
+		dependencies,
+	)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want submission failure; stdout = %q, stderr = %q",
+			exitCode, stdout.String(), stderr.String())
+	}
+
+	var progressLines []string
+	for _, line := range strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n") {
+		if strings.Contains(line, "batches submitted") {
+			progressLines = append(progressLines, line)
+		}
+	}
+	if !reflect.DeepEqual(progressLines, []string{"progress: 1/3 batches submitted"}) {
+		t.Fatalf("submission progress lines = %q, want only the first successful batch; stdout = %q",
+			progressLines, stdout.String())
+	}
+	if submissionRequests != 3 {
+		t.Fatalf("submission requests = %d, want one success and two failed attempts", submissionRequests)
+	}
+
+	store := dependencies.JournalStore
+	runs, err := store.ListRuns("personal")
+	if err != nil {
+		t.Fatalf("list import runs: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("import runs = %d, want one", len(runs))
+	}
+	run, err := store.OpenRun("personal", runs[0].InvocationID)
+	if err != nil {
+		t.Fatalf("open failed import run: %v", err)
+	}
+	if len(run.Batches) != 2 || run.Batches[0].State != journal.StateSubmitted || run.Batches[1].State != journal.StatePlanned {
+		t.Fatalf("batch states = %#v, want submitted batch 1 and planned batch 2", run.Batches)
+	}
+	var batchFailure, runFailure bool
+	for _, event := range run.Events {
+		switch event.Type {
+		case "submission.batch.failed":
+			batchFailure = event.Data["batch"] == "2"
+		case "run.failed":
+			runFailure = event.Data["related_batch"] == "2"
+		}
+	}
+	if !batchFailure || !runFailure {
+		t.Fatalf("failure events = %#v, want batch and run failures related to batch 2", run.Events)
+	}
+}
+
 func runImportWithGeneratedSpotifyExport(t *testing.T, count int) string {
 	t.Helper()
 	root := t.TempDir()
