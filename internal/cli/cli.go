@@ -673,11 +673,33 @@ func redactDiagnosticError(err error, secret string) string {
 }
 
 func printDoctorResult(w io.Writer, result doctorResult) {
-	if result.err == nil {
-		fmt.Fprintf(w, "PASS: %s\n", result.name)
-		return
+	status, color := "PASS", "32"
+	if result.err != nil {
+		status, color = "FAIL", "31"
 	}
-	fmt.Fprintf(w, "FAIL: %s: %s\n", result.name, result.err)
+	if doctorColorEnabled(w) {
+		status = fmt.Sprintf("\x1b[%sm%s\x1b[0m", color, status)
+	}
+	if result.err == nil {
+		fmt.Fprintf(w, "%s: %s\n", status, result.name)
+	} else {
+		fmt.Fprintf(w, "%s: %s: %s\n", status, result.name, result.err)
+	}
+}
+
+func doctorColorEnabled(w io.Writer) bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	if os.Getenv("FORCE_COLOR") != "" || os.Getenv("CLICOLOR_FORCE") != "" {
+		return true
+	}
+	file, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func printDoctorDependentFailures(w io.Writer, name, reason string) {

@@ -512,3 +512,78 @@ func stringMapsEqual(left, right map[string]string) bool {
 	}
 	return true
 }
+
+func TestDoctorOutputWithoutColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("FORCE_COLOR", "")
+	t.Setenv("CLICOLOR_FORCE", "")
+
+	got := doctorOutputForColorTest(t)
+	if strings.ContainsRune(got, '\x1b') {
+		t.Fatalf("output contains ANSI escape sequences: %q", got)
+	}
+	for _, want := range []string{
+		"PASS: configuration readability",
+		"FAIL: credential presence and validity: no stored credential; run login",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output = %q, want substring %q", got, want)
+		}
+	}
+}
+
+func TestDoctorOutputWithForcedColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("FORCE_COLOR", "1")
+	t.Setenv("CLICOLOR_FORCE", "")
+
+	got := doctorOutputForColorTest(t)
+	for _, want := range []string{
+		"\x1b[32mPASS\x1b[0m: configuration readability\n",
+		"\x1b[31mFAIL\x1b[0m: credential presence and validity: no stored credential; run login\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output = %q, want substring %q", got, want)
+		}
+	}
+}
+
+func TestDoctorOutputNoColorOverridesForcedColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("FORCE_COLOR", "1")
+	t.Setenv("CLICOLOR_FORCE", "")
+
+	got := doctorOutputForColorTest(t)
+	if strings.ContainsRune(got, '\x1b') {
+		t.Fatalf("output contains ANSI escape sequences despite NO_COLOR: %q", got)
+	}
+	for _, want := range []string{
+		"PASS: configuration readability",
+		"FAIL: credential presence and validity: no stored credential; run login",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output = %q, want substring %q", got, want)
+		}
+	}
+}
+
+func doctorOutputForColorTest(t *testing.T) string {
+	t.Helper()
+	configStore, journalStore := healthyDoctorStores(t, t.TempDir())
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"doctor"},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: &commandCredentialStore{},
+			LastFMClient:    healthyDoctorClient(t, `{"user":{"name":"alice"}}`),
+			JournalStore:    journalStore,
+		},
+	)
+	if exitCode != 1 {
+		t.Fatalf("doctor exit code = %d, want 1; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	return stdout.String()
+}
