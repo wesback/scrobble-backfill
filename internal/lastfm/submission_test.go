@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/wesback/scrobble-backfill/internal/journal"
+	"github.com/wesback/scrobble-backfill/internal/report"
 )
 
 const testSubmissionSession = "submission-session-secret"
@@ -64,7 +65,7 @@ func TestSubmissionBatchesAtFiftyAndResumesWithoutRedispatchingSubmittedBatch(t 
 			http.Error(w, "interrupted", http.StatusBadRequest)
 			return
 		}
-		fmt.Fprint(w, `{}`)
+		writeAllAcceptedScrobbles(w, r)
 	}))
 	defer server.Close()
 
@@ -130,7 +131,7 @@ func TestSubmissionReportsProgressAfterEachBatchIsMarkedSubmitted(t *testing.T) 
 			t.Errorf("method = %q, want track.scrobble", method)
 		}
 		requests++
-		fmt.Fprint(w, `{}`)
+		writeAllAcceptedScrobbles(w, r)
 	}))
 	defer server.Close()
 
@@ -197,7 +198,7 @@ func TestSubmissionReportsOnlySuccessfulBatchesBeforeFailure(t *testing.T) {
 		}
 		requests++
 		if requests <= 2 {
-			fmt.Fprint(w, `{}`)
+			writeAllAcceptedScrobbles(w, r)
 			return
 		}
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
@@ -273,7 +274,7 @@ func TestSubmissionUsesExponentialRetryDelaysAndPacesBatches(t *testing.T) {
 			http.Error(w, "retry later", status)
 			return
 		}
-		fmt.Fprint(w, `{}`)
+		writeAllAcceptedScrobbles(w, r)
 	}))
 	defer server.Close()
 
@@ -310,7 +311,6 @@ func TestSubmissionLeavesFailedBatchPlannedAndRedactsSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not allowed", http.StatusForbidden)
 	}))
@@ -344,6 +344,131 @@ func TestSubmissionLeavesFailedBatchPlannedAndRedactsSession(t *testing.T) {
 	if len(resume.Submitted) != 0 || len(resume.Pending) != 1 || resume.Pending[0].State != journal.StatePlanned {
 		t.Fatalf("failed batch journal state = %#v", resume)
 	}
+}
+
+func TestSubmissionRecordsPartialAcceptanceAndIgnoredReason(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-partial-acceptance")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := []journal.Submission{
+		{Artist: "Artist", Track: "Accepted", Timestamp: time.Unix(1, 0)},
+		{Artist: "Artist", Track: "Too old", Timestamp: time.Unix(2, 0)},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"scrobbles":{"@attr":{"accepted":1,"ignored":1},"scrobble":[{"ignoredMessage":{"code":0,"#text":""}},{"ignoredMessage":{"code":3,"#text":"Timestamp is too old"}}]}}`)
+	}))
+	defer server.Close()
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+	if err := service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays); err != nil {
+		t.Fatalf("submit partial batch: %v", err)
+	}
+
+	result, err := store.OpenRun(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("open result journal: %v", err)
+	}
+	if len(result.Batches) != 1 || result.Batches[0].State != journal.StateSubmitted {
+		t.Fatalf("batch result = %#v, want completed request", result.Batches)
+	}
+	document := report.Build(result, report.Options{})
+	if document.Counts.ImportedScrobbles != 1 || document.Counts.IgnoredScrobbles != 1 {
+		t.Fatalf("report counts = %#v, want one accepted and one ignored", document.Counts)
+	}
+	if len(document.Ignored) != 1 ||
+		document.Ignored[0].Track != "Too old" ||
+		document.Ignored[0].Reason != "Timestamp is too old" {
+		t.Fatalf("ignored details = %#v, want the ignored track and reason", document.Ignored)
+	}
+}
+
+func TestSubmissionReportCountUsesAcceptedCountFromAPI(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-accepted-count")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := []journal.Submission{
+		{Artist: "Artist", Track: "First", Timestamp: time.Unix(1, 0)},
+		{Artist: "Artist", Track: "Second", Timestamp: time.Unix(2, 0)},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeAllAcceptedScrobbles(w, r)
+	}))
+	defer server.Close()
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+	if err := service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays); err != nil {
+		t.Fatalf("submit accepted batch: %v", err)
+	}
+	result, err := store.OpenRun(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("open result journal: %v", err)
+	}
+	document := report.Build(result, report.Options{})
+	if document.Counts.ImportedScrobbles != 2 || document.Counts.IgnoredScrobbles != 0 {
+		t.Fatalf("report counts = %#v, want the API's accepted count of two", document.Counts)
+	}
+}
+
+func TestSubmissionRejectsMissingMalformedAndInconsistentCounts(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing counts", body: `{"scrobbles":{"@attr":{},"scrobble":[]}}`},
+		{name: "malformed accepted count", body: `{"scrobbles":{"@attr":{"accepted":"many","ignored":"0"},"scrobble":[]}}`},
+		{name: "inconsistent counts", body: `{"scrobbles":{"@attr":{"accepted":"1","ignored":"0"},"scrobble":[{"ignoredMessage":{"code":"0","#text":""}},{"ignoredMessage":{"code":"0","#text":""}}]}}`},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+			run, err := store.CreateRun("personal", fmt.Sprintf("invalid-response-%d", index))
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			client := NewClient("app-key", "app-secret")
+			client.BaseURL = server.URL
+			service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+			err = service.Submit(context.Background(), AuthenticatedProfile{
+				Username: "alice", SessionKey: testSubmissionSession,
+			}, run, []journal.Submission{
+				{Artist: "Artist", Track: "One", Timestamp: time.Unix(1, 0)},
+				{Artist: "Artist", Track: "Two", Timestamp: time.Unix(2, 0)},
+			})
+			if err == nil || !strings.Contains(err.Error(), "Last.fm scrobble response") {
+				t.Fatalf("submission error = %v, want explicit response validation error", err)
+			}
+			resume, err := store.Resume(run.Profile, run.InvocationID)
+			if err != nil {
+				t.Fatalf("resume invalid response run: %v", err)
+			}
+			if len(resume.Submitted) != 0 || len(resume.Pending) != 1 {
+				t.Fatalf("journal after invalid response = %#v, want one still-planned batch", resume)
+			}
+		})
+	}
+}
+
+func writeAllAcceptedScrobbles(w http.ResponseWriter, r *http.Request) {
+	items := make([]string, 0)
+	for index := 0; r.FormValue(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+		items = append(items, `{"ignoredMessage":{"code":0,"#text":""}}`)
+	}
+	fmt.Fprintf(w, `{"scrobbles":{"@attr":{"accepted":%d,"ignored":0},"scrobble":[%s]}}`,
+		len(items), strings.Join(items, ","))
 }
 
 func TestSubmissionLeavesExhaustedRetryBatchPlanned(t *testing.T) {

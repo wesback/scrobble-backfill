@@ -376,18 +376,18 @@ treated as success. `--batch-delay 0s` is valid but removes the normal
 between-batch pacing; use it only when the consequences are understood.
 
 Imports are journaled separately for each profile. A run records its
-non-secret settings, planned batches, successful submissions, warnings, and
-failures. A batch is made durable before dispatch and is marked submitted
-only after the request succeeds. The journal therefore distinguishes
-submitted batches from planned work after a process interruption, and its
-batch state is resumable when the same invocation is reopened by the
-submission service. The current CLI does not expose a `resume` command or
+non-secret settings, planned batches, completed requests, accepted scrobbles,
+ignored scrobbles and their Last.fm reasons, warnings, and failures. A batch
+is made durable before dispatch and is marked submitted only after a valid
+response completes the request. The journal therefore distinguishes
+completed requests from accepted scrobbles and planned work after a process
+interruption. The current CLI does not expose a `resume` command or
 flag, however: every `import` command creates a new invocation ID. After an
 interrupted CLI process, keep the journal, rerun `import` with the same
 export, and understand that this starts a new journal run rather than
 continuing the old one. The new live comparison skips plays already visible
-in Last.fm; use the old invocation ID with `verify` or `report` to inspect
-what the interrupted run recorded.
+in Last.fm, while ignored plays can be reconsidered; use the old invocation
+ID with `verify` or `report` to inspect what the interrupted run recorded.
 
 An import of 100 or fewer missing plays proceeds without an interactive
 confirmation. More than 100 requires an explicit `y`/`yes`, unless `--yes`
@@ -428,9 +428,11 @@ rescrobble report --html > import-report.html
 
 Reports contain structured run information: format version, profile,
 invocation ID, local date range, timestamp tolerance, eligibility rule,
-batch delay, counts for imported scrobbles, skipped duplicates, failures,
-warnings, metadata issues, eligible plays and exclusions, execution timing,
-and sanitized journal events. Reports do not contain session credentials.
+batch delay, counts for imported and ignored scrobbles, skipped duplicates,
+failures, warnings, metadata issues, eligible plays and exclusions, execution
+timing, ignored-item reasons, and sanitized journal events. The imported count
+reflects Last.fm's accepted count, not the number of plays sent in completed
+requests. Reports do not contain session credentials.
 JSON is intended for automation, CSV for tabular tools, and HTML for a
 human-readable saved report.
 
