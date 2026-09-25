@@ -1081,16 +1081,23 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 					}
 					return nil
 				}
+				warnings := newWarningPrinter(stderr, progress.IsTerminal(), options.logLevel >= observability.LevelVerbose)
 				var ingestErr error
 				ingestionSummary, ingestErr = spotify.IngestFiles(ctx, paths, progressingConsume, func(warning spotify.Warning) {
-					fmt.Fprintf(stderr, "warning: %s: %s\n", warning.Code, warning.Reason)
+					warnings.Print(warning)
 					events = append(events, journal.Event{
 						Type: "ingestion.warning", Timestamp: time.Now().UTC(),
 						Data: warningEventData(warning),
 					})
 				})
+				warningsErr := warnings.Flush()
+				// The ingestion error is the root cause; a failure to write
+				// warning output must never mask it.
 				if ingestErr != nil {
 					return ingestErr
+				}
+				if warningsErr != nil {
+					return fmt.Errorf("write ingestion warnings: %w", warningsErr)
 				}
 				return progress.Complete(fmt.Sprintf("progress complete: %d records ingested", deliveredRecords))
 			},
@@ -1688,4 +1695,56 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  --json/--csv/--html  select exactly one report format")
 	fmt.Fprintln(w, "  --help            show this help")
 	fmt.Fprintln(w, "  --version         show the application version")
+}
+
+// warningPrinter writes ingestion warnings to w. Unless verbose, only the
+// first warning of each code is printed as it happens and Flush prints one
+// count line per code, so a run with thousands of identical exclusions stays
+// readable. On a terminal, the in-place progress line is cleared first so
+// warning text never shares a line with it.
+type warningPrinter struct {
+	w        io.Writer
+	terminal bool
+	verbose  bool
+	counts   map[string]int
+	order    []string
+	err      error
+}
+
+func newWarningPrinter(w io.Writer, terminal, verbose bool) *warningPrinter {
+	return &warningPrinter{w: w, terminal: terminal, verbose: verbose, counts: make(map[string]int)}
+}
+
+func (p *warningPrinter) Print(warning spotify.Warning) {
+	if _, seen := p.counts[warning.Code]; !seen {
+		p.order = append(p.order, warning.Code)
+	}
+	p.counts[warning.Code]++
+	if p.verbose || p.counts[warning.Code] == 1 {
+		p.writef("warning: %s: %s\n", warning.Code, warning.Reason)
+	}
+}
+
+// Flush prints the per-code totals for codes that repeated and returns the
+// first write error encountered, if any.
+func (p *warningPrinter) Flush() error {
+	if !p.verbose {
+		for _, code := range p.order {
+			if p.counts[code] > 1 {
+				p.writef("warning: %s: %d records\n", code, p.counts[code])
+			}
+		}
+	}
+	return p.err
+}
+
+func (p *warningPrinter) writef(format string, args ...any) {
+	if p.err != nil {
+		return
+	}
+	line := fmt.Sprintf(format, args...)
+	if p.terminal {
+		line = "\r\x1b[2K" + line
+	}
+	_, p.err = io.WriteString(p.w, line)
 }
