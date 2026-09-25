@@ -419,6 +419,48 @@ func TestSubmissionReportCountUsesAcceptedCountFromAPI(t *testing.T) {
 	}
 }
 
+func TestSubmissionDescribesIgnoredItemWithEmptyReason(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-empty-reason")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := []journal.Submission{
+		{Artist: "Artist", Track: "Accepted", Timestamp: time.Unix(1, 0)},
+		{Artist: "Artist", Track: "Old", Timestamp: time.Unix(2, 0)},
+		{Artist: "Artist", Track: "Odd", Timestamp: time.Unix(3, 0)},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"scrobbles":{"@attr":{"accepted":1,"ignored":2},"scrobble":[{"ignoredMessage":{"code":0,"#text":""}},{"ignoredMessage":{"code":3,"#text":""}},{"ignoredMessage":{"code":"42","#text":"  "}}]}}`)
+	}))
+	defer server.Close()
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+	if err := service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays); err != nil {
+		t.Fatalf("submit batch with empty ignore reasons: %v", err)
+	}
+	result, err := store.OpenRun(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("open result journal: %v", err)
+	}
+	var reasons []string
+	for _, event := range result.Events {
+		if event.Type == "submission.scrobble.ignored" {
+			reasons = append(reasons, event.Data["code"]+": "+event.Data["reason"])
+		}
+	}
+	want := []string{
+		"3: Timestamp is too old (Last.fm code 3)",
+		"42: Ignored by Last.fm without a reason (code 42)",
+	}
+	if !reflect.DeepEqual(reasons, want) {
+		t.Fatalf("ignored reasons = %q, want %q", reasons, want)
+	}
+}
+
 func TestSubmissionRejectsMissingMalformedAndInconsistentCounts(t *testing.T) {
 	tests := []struct {
 		name string

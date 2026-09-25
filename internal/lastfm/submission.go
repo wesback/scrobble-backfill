@@ -415,7 +415,9 @@ func parseSubmissionResponse(response map[string]any, expected int) (submissionR
 		if code != "0" {
 			reason := strings.TrimSpace(text)
 			if reason == "" {
-				return submissionResult{}, fmt.Errorf("Last.fm scrobble response item %d is ignored without a reason", index+1)
+				// Last.fm often sends an empty ignoredMessage text. Describe the
+				// code ourselves rather than aborting the whole submission.
+				reason = describeIgnoredCode(code)
 			}
 			result.ignored = append(result.ignored, ignoredSubmission{index: index, code: code, reason: reason})
 		}
@@ -427,6 +429,25 @@ func parseSubmissionResponse(response map[string]any, expected int) (submissionR
 		)
 	}
 	return result, nil
+}
+
+// describeIgnoredCode names a Last.fm ignoredMessage code for responses that
+// carry no text.
+func describeIgnoredCode(code string) string {
+	switch code {
+	case "1":
+		return "Artist was ignored (Last.fm code 1)"
+	case "2":
+		return "Track was ignored (Last.fm code 2)"
+	case "3":
+		return "Timestamp is too old (Last.fm code 3)"
+	case "4":
+		return "Timestamp is too new (Last.fm code 4)"
+	case "5":
+		return "Daily scrobble limit exceeded (Last.fm code 5)"
+	default:
+		return "Ignored by Last.fm without a reason (code " + code + ")"
+	}
 }
 
 func parseIgnoredCode(value any) (string, error) {
