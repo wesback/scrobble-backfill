@@ -349,7 +349,8 @@ The following are explicitly excluded from scrobbling and counted in the
 summary or diagnostics:
 
 - podcast episodes;
-- local or offline files;
+- local files without a Spotify track URI; offline-mode plays of Spotify tracks
+  are included;
 - malformed records or records missing required metadata;
 - corrupt or unavailable JSON inputs; and
 - unreadable or unsafe ZIP entries.
@@ -498,8 +499,9 @@ persistently failing request remains a failure in the journal.
 ### The export is malformed or contains unexpected sources
 
 Keep the original Spotify JSON or ZIP and run `analyse` first. Individual
-malformed records, missing fields, podcasts, and local/offline plays are
-reported as warnings or exclusions while valid later records continue.
+malformed records, missing fields, podcasts, and local files are reported as
+warnings or exclusions while valid later records continue. Offline-mode plays
+of Spotify tracks are included when they have the required metadata.
 Correct the export or omit an unavailable input if the diagnostics identify
 an input-level problem.
 

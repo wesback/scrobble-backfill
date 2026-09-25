@@ -98,10 +98,12 @@ whole import over one bad entry. All such warnings are visible in the
 run's report (below), not just buried in logs.
 
 Only music-track plays are in scope for scrobbling. Podcast episodes
-and local/offline files present in the same export are recognized and
-explicitly excluded — reported as "not scrobblable" rather than
-silently dropped — since they generally lack the metadata (or, for
-podcasts, the relevance) needed for Last.fm scrobbling.
+and local files without a Spotify track URI present in the same export
+are recognized and explicitly excluded — reported as "not scrobblable"
+rather than silently dropped — since they generally lack the metadata
+(or, for podcasts, the relevance) needed for Last.fm scrobbling.
+Offline-mode plays of Spotify tracks are included when they have the
+required metadata.
 
 ZIP handling treats the archive as untrusted input: it must resist
 path-traversal ("zip slip") extraction and must not allow an
