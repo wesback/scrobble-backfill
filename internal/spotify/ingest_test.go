@@ -39,8 +39,8 @@ func TestIngestNormalizesMusicRecordsAndReportsSkippedInputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if len(plays) != 2 || summary.Emitted != 2 {
-		t.Fatalf("emitted plays = %d (summary %d), want 2", len(plays), summary.Emitted)
+	if len(plays) != 3 || summary.Emitted != 3 {
+		t.Fatalf("emitted plays = %d (summary %d), want 3", len(plays), summary.Emitted)
 	}
 	if got := plays[0]; got.TrackName != "Track" || got.ArtistName != "Artist" ||
 		got.AlbumName != "Album" || got.Milliseconds != 180000 ||
@@ -48,11 +48,14 @@ func TestIngestNormalizesMusicRecordsAndReportsSkippedInputs(t *testing.T) {
 		got.SpotifyTrackID != "abc" || !got.Timestamp.Equal(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)) {
 		t.Fatalf("normalized play = %#v", got)
 	}
-	if summary.ExcludedPodcasts != 1 || summary.ExcludedLocalOffline != 2 {
-		t.Fatalf("exclusion counts = podcast %d, local/offline %d; want 1 and 2", summary.ExcludedPodcasts, summary.ExcludedLocalOffline)
+	if plays[1].TrackName != "Offline" || plays[1].SpotifyTrackURI != "spotify:track:offline" {
+		t.Fatalf("offline Spotify play = %#v; want the offline track to be emitted", plays[1])
 	}
-	if summary.Warnings != 6 || len(warnings) != 6 {
-		t.Fatalf("warnings = summary %d, collected %d; want 6", summary.Warnings, len(warnings))
+	if summary.ExcludedPodcasts != 1 || summary.ExcludedLocal != 1 {
+		t.Fatalf("exclusion counts = podcast %d, local %d; want 1 and 1", summary.ExcludedPodcasts, summary.ExcludedLocal)
+	}
+	if summary.Warnings != 5 || len(warnings) != 5 {
+		t.Fatalf("warnings = summary %d, collected %d; want 5", summary.Warnings, len(warnings))
 	}
 	counts := map[string]int{}
 	for _, warning := range warnings {
@@ -65,13 +68,145 @@ func TestIngestNormalizesMusicRecordsAndReportsSkippedInputs(t *testing.T) {
 		CodeMalformedRecord: 1,
 		CodeMissingField:    1,
 		CodePodcast:         1,
-		CodeLocalOrOffline:  2,
+		CodeLocal:           1,
 		CodeCorruptJSON:     1,
 	}
 	for code, want := range wantCodes {
 		if counts[code] != want {
 			t.Fatalf("warning code %q count = %d, want %d", code, counts[code], want)
 		}
+	}
+}
+
+func TestIngestExcludesRecordsWithoutSpotifyTrackURI(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{name: "null", uri: "null"},
+		{name: "empty", uri: `""`},
+		{name: "other URI", uri: `"local:file"`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := strings.Replace(
+				recordJSON("Local", "Artist", "Album", "spotify:track:local"),
+				`"spotify_track_uri":"spotify:track:local"`,
+				`"spotify_track_uri":`+test.uri,
+				1,
+			)
+			delivered := 0
+			var warning Warning
+			summary, err := Ingest(context.Background(), []Input{{
+				Name:   "history.json",
+				Reader: strings.NewReader("[" + record + "]"),
+			}}, func(Play) error {
+				delivered++
+				return nil
+			}, func(got Warning) {
+				warning = got
+			})
+			if err != nil {
+				t.Fatalf("ingest: %v", err)
+			}
+			if delivered != 0 || summary.Emitted != 0 || summary.ExcludedLocal != 1 {
+				t.Fatalf("delivered = %d, summary = %#v; want no play and one local exclusion", delivered, summary)
+			}
+			if warning.Code != CodeLocal || warning.Reason != "record has no Spotify track URI" {
+				t.Fatalf("warning = %#v; want local exclusion with missing-URI reason", warning)
+			}
+			encoded, err := json.Marshal(summary)
+			if err != nil {
+				t.Fatalf("marshal summary: %v", err)
+			}
+			if !strings.Contains(string(encoded), `"excluded_local":1`) {
+				t.Fatalf("summary JSON = %s; want excluded_local count", encoded)
+			}
+		})
+	}
+}
+
+func TestIngestIncludesOfflineSpotifyTrack(t *testing.T) {
+	record := strings.Replace(
+		recordJSON("Offline", "Artist", "Album", "spotify:track:offline"),
+		`"offline":false`,
+		`"offline":true`,
+		1,
+	)
+	var plays []Play
+	var warnings []Warning
+	summary, err := Ingest(context.Background(), []Input{{
+		Name:   "history.json",
+		Reader: strings.NewReader("[" + record + "]"),
+	}}, func(play Play) error {
+		plays = append(plays, play)
+		return nil
+	}, func(warning Warning) {
+		warnings = append(warnings, warning)
+	})
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if len(plays) != 1 || summary.Emitted != 1 {
+		t.Fatalf("plays = %#v, summary = %#v; want one emitted play", plays, summary)
+	}
+	if plays[0].TrackName != "Offline" || plays[0].ArtistName != "Artist" ||
+		plays[0].AlbumName != "Album" || plays[0].SpotifyTrackURI != "spotify:track:offline" {
+		t.Fatalf("offline Spotify play = %#v; want full track metadata", plays[0])
+	}
+	if summary.ExcludedPodcasts != 0 || summary.ExcludedLocal != 0 || summary.Warnings != 0 || len(warnings) != 0 {
+		t.Fatalf("offline Spotify play produced exclusions or warnings: summary = %#v, warnings = %#v", summary, warnings)
+	}
+}
+
+func TestDeprecatedLocalOfflineReferencesAbsent(t *testing.T) {
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	repositoryRoot := workingDirectory
+	for {
+		if _, err := os.Stat(filepath.Join(repositoryRoot, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(repositoryRoot)
+		if parent == repositoryRoot {
+			t.Fatal("could not find repository root")
+		}
+		repositoryRoot = parent
+	}
+
+	deprecatedReferences := []string{
+		"excluded_local" + "_or_offline",
+		"excluded_local" + "_offline",
+		"CodeLocal" + "OrOffline",
+		"ExcludedLocal" + "Offline",
+	}
+	err = filepath.Walk(repositoryRoot, func(filePath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		contents, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		for _, reference := range deprecatedReferences {
+			if strings.Contains(string(contents), reference) {
+				t.Errorf("deprecated reference %q found in %s", reference, filePath)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("search repository for deprecated references: %v", err)
 	}
 }
 
@@ -179,6 +314,7 @@ func TestIngestStreamsGenerated100000Records(t *testing.T) {
 				"master_metadata_album_album_name": "podcast", "spotify_episode_uri": "spotify:episode:e",
 			}
 		case 1:
+			valid++
 			value = map[string]any{
 				"ts": "2024-01-01T00:00:00Z", "platform": "web", "ms_played": 1,
 				"master_metadata_track_name": "offline", "master_metadata_album_artist_name": "artist",
@@ -226,11 +362,11 @@ func TestIngestStreamsGenerated100000Records(t *testing.T) {
 	if delivered != valid || summary.Emitted != valid {
 		t.Fatalf("delivered = %d (summary %d), want %d valid records", delivered, summary.Emitted, valid)
 	}
-	if summary.Records != total || summary.ExcludedPodcasts != 100 || summary.ExcludedLocalOffline != 200 {
-		t.Fatalf("summary = %#v, want %d records, 100 podcasts, 200 local/offline", summary, total)
+	if summary.Records != total || summary.ExcludedPodcasts != 100 || summary.ExcludedLocal != 100 {
+		t.Fatalf("summary = %#v, want %d records, 100 podcasts, 100 local", summary, total)
 	}
-	if warningCodes[CodeMalformedRecord] != 100 || summary.Warnings != 400 {
-		t.Fatalf("warning codes = %#v, summary warnings = %d; want 100 malformed and 400 total", warningCodes, summary.Warnings)
+	if warningCodes[CodeMalformedRecord] != 100 || summary.Warnings != 300 {
+		t.Fatalf("warning codes = %#v, summary warnings = %d; want 100 malformed and 300 total", warningCodes, summary.Warnings)
 	}
 }
 

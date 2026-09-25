@@ -23,7 +23,7 @@ const (
 	CodeMalformedRecord  = "malformed_record"
 	CodeMissingField     = "missing_required_field"
 	CodePodcast          = "excluded_podcast"
-	CodeLocalOrOffline   = "excluded_local_or_offline"
+	CodeLocal            = "excluded_local"
 	CodeInputUnavailable = "input_unavailable"
 	CodeArchivePath      = "unsafe_archive_path"
 	CodeArchiveEntry     = "unreadable_archive_entry"
@@ -74,12 +74,12 @@ type Warning struct {
 
 // Summary contains counts only; plays are never accumulated by the parser.
 type Summary struct {
-	Inputs               int `json:"inputs"`
-	Records              int `json:"records"`
-	Emitted              int `json:"emitted"`
-	Warnings             int `json:"warnings"`
-	ExcludedPodcasts     int `json:"excluded_podcasts"`
-	ExcludedLocalOffline int `json:"excluded_local_offline"`
+	Inputs           int `json:"inputs"`
+	Records          int `json:"records"`
+	Emitted          int `json:"emitted"`
+	Warnings         int `json:"warnings"`
+	ExcludedPodcasts int `json:"excluded_podcasts"`
+	ExcludedLocal    int `json:"excluded_local"`
 }
 
 // Consumer receives one normalized play. Returning an error stops ingestion.
@@ -179,7 +179,7 @@ func IngestFilesWithOptions(ctx context.Context, paths []string, consumer Consum
 		summary.Emitted += fileSummary.Emitted
 		summary.Warnings += fileSummary.Warnings
 		summary.ExcludedPodcasts += fileSummary.ExcludedPodcasts
-		summary.ExcludedLocalOffline += fileSummary.ExcludedLocalOffline
+		summary.ExcludedLocal += fileSummary.ExcludedLocal
 		if ingestErr != nil {
 			return summary, ingestErr
 		}
@@ -437,7 +437,6 @@ type rawRecord struct {
 	EpisodeName       *string `json:"episode_name"`
 	EpisodeShowName   *string `json:"episode_show_name"`
 	SpotifyEpisodeURI *string `json:"spotify_episode_uri"`
-	Offline           *bool   `json:"offline"`
 }
 
 func processRecord(ctx context.Context, input string, number int, raw json.RawMessage, consumer Consumer, warningHandler WarningHandler, summary *Summary) error {
@@ -474,27 +473,17 @@ func processRecord(ctx context.Context, input string, number int, raw json.RawMe
 		})
 		return nil
 	}
-	if record.Offline != nil && *record.Offline {
-		summary.ExcludedLocalOffline++
-		emitWarning(summary, warningHandler, Warning{
-			Input:    input,
-			Record:   number,
-			Code:     CodeLocalOrOffline,
-			Reason:   "record is marked offline",
-			Severity: "warning",
-		})
-		return nil
-	}
 	uri := ""
 	if record.SpotifyTrackURI != nil {
 		uri = strings.TrimSpace(*record.SpotifyTrackURI)
 	}
-	if !strings.HasPrefix(uri, "spotify:track:") || strings.TrimPrefix(uri, "spotify:track:") == "" {
-		summary.ExcludedLocalOffline++
+	const spotifyTrackPrefix = "spotify:track:"
+	if !strings.HasPrefix(uri, spotifyTrackPrefix) || strings.TrimSpace(strings.TrimPrefix(uri, spotifyTrackPrefix)) == "" {
+		summary.ExcludedLocal++
 		emitWarning(summary, warningHandler, Warning{
 			Input:    input,
 			Record:   number,
-			Code:     CodeLocalOrOffline,
+			Code:     CodeLocal,
 			Reason:   "record has no Spotify track URI",
 			Severity: "warning",
 		})

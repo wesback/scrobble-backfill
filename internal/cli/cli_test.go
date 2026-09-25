@@ -862,6 +862,7 @@ func TestAnalyseReportsProfileBoundsConfidenceAndExclusionsWithoutMutatingState(
 		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Missing","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:missing"}`,
 		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"episode_name":"Episode","episode_show_name":"Show","spotify_episode_uri":"spotify:episode:episode"}`,
 		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Offline","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:offline","offline":true}`,
+		`{"ts":"2024-01-02T12:00:00Z","platform":"web","ms_played":240000,"master_metadata_track_name":"Local","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":null}`,
 	)
 
 	var methods []string
@@ -935,18 +936,26 @@ func TestAnalyseReportsProfileBoundsConfidenceAndExclusionsWithoutMutatingState(
 	output := stdout.String()
 	for _, want := range []string{
 		`Analysis summary for profile "work"`,
-		"Total Spotify plays: 5",
+		"Total Spotify plays: 6",
 		"In-scope Last.fm scrobbles: 2",
-		"Estimated missing plays: 1",
+		"Estimated missing plays: 2",
 		"Covered date range: 2024-01-02 to 2024-01-02",
 		"Timestamp tolerance: 20s",
-		"Confidence: high=1 medium=1 low=1",
+		"Confidence: high=1 medium=1 low=2",
 		"excluded_podcast: 1",
-		"excluded_local_or_offline: 1",
+		"excluded_local: 1",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("stdout = %q, want %q", output, want)
 		}
+	}
+	wantExclusionSummary := "Source exclusion reasons:\n  excluded_local: 1\n  excluded_podcast: 1\n"
+	if !strings.Contains(output, wantExclusionSummary) {
+		t.Fatalf("stdout = %q, want rendered source exclusions %q", output, wantExclusionSummary)
+	}
+	deprecatedExclusionCode := "excluded_local" + "_or_offline"
+	if strings.Contains(output, deprecatedExclusionCode) {
+		t.Fatalf("stdout = %q, want no deprecated source exclusion code", output)
 	}
 	after, err := os.ReadFile(store.Path)
 	if err != nil {
