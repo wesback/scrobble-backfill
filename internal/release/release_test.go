@@ -9,13 +9,17 @@ import (
 func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 	workflow := readRepositoryFile(t, ".github/workflows/release.yml")
 
+	lowercaseWorkflow := strings.ToLower(workflow)
+	for _, unsupported := range []string{"darwin", "macos"} {
+		if strings.Contains(lowercaseWorkflow, unsupported) {
+			t.Errorf("release workflow contains unsupported platform reference %q", unsupported)
+		}
+	}
+
 	for _, target := range []string{
 		"goos: windows",
-		"goos: darwin",
 		"goos: linux",
 		"runner: windows-2022",
-		"runner: macos-15-intel",
-		"runner: macos-14",
 		"runner: ubuntu-24.04",
 	} {
 		if !strings.Contains(workflow, target) {
@@ -24,8 +28,6 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 	}
 	for _, binary := range []string{
 		"rescrobble-windows-amd64.exe",
-		"rescrobble-darwin-amd64",
-		"rescrobble-darwin-arm64",
 		"rescrobble-linux-amd64",
 	} {
 		if !strings.Contains(workflow, binary) {
@@ -59,27 +61,22 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 		}
 	}
 	for _, target := range []string{
-		"goos: darwin\n            goarch: arm64\n            binary: rescrobble-darwin-arm64",
+		"          - name: Windows amd64\n            runner: windows-2022\n            goos: windows\n            goarch: amd64\n            binary: rescrobble-windows-amd64.exe",
+		"          - name: Linux amd64\n            runner: ubuntu-24.04\n            goos: linux\n            goarch: amd64\n            binary: rescrobble-linux-amd64",
 	} {
 		if !strings.Contains(workflow, target) {
 			t.Errorf("release workflow does not define %q", target)
 		}
 	}
-	if strings.Count(workflow, "binary: ") != 4 {
-		t.Errorf("release workflow defines %d binaries, want exactly 4", strings.Count(workflow, "binary: "))
+	if strings.Count(workflow, "          - name: ") != 2 {
+		t.Errorf("release workflow defines %d matrix entries, want exactly 2", strings.Count(workflow, "          - name: "))
 	}
-	checksumStart := strings.Index(workflow, "binaries=(\n")
-	if checksumStart == -1 {
-		t.Fatal("release workflow does not define a checksum binary list")
+	if strings.Count(workflow, "binary: ") != 2 {
+		t.Errorf("release workflow defines %d binaries, want exactly 2", strings.Count(workflow, "binary: "))
 	}
-	checksumEnd := strings.Index(workflow[checksumStart:], "\n          )")
-	if checksumEnd == -1 {
-		t.Fatal("release workflow does not define a checksum binary list")
-	}
-	checksumBinaries := workflow[checksumStart : checksumStart+checksumEnd]
-	if strings.Count(checksumBinaries, "rescrobble-darwin-arm64") != 1 {
-		t.Errorf("checksum binary list contains rescrobble-darwin-arm64 %d times, want exactly once",
-			strings.Count(checksumBinaries, "rescrobble-darwin-arm64"))
+	checksumList := "binaries=(\n            rescrobble-windows-amd64.exe\n            rescrobble-linux-amd64\n          )"
+	if strings.Count(workflow, checksumList) != 1 {
+		t.Errorf("release workflow checksum list does not contain exactly the Windows and Linux binaries once")
 	}
 	if !strings.Contains(workflow, "uses: actions/attest-build-provenance@v2") ||
 		!strings.Contains(workflow, "subject-path: ${{ matrix.binary }}") {
@@ -90,14 +87,17 @@ func TestReleaseWorkflowDefinesSupportedTargetsAndTagBuilds(t *testing.T) {
 	}
 	for _, asset := range []string{
 		"release-assets/rescrobble-windows-amd64.exe",
-		"release-assets/rescrobble-darwin-amd64",
-		"release-assets/rescrobble-darwin-arm64",
 		"release-assets/rescrobble-linux-amd64",
 		"release-assets/SHA256SUMS",
 	} {
 		if !strings.Contains(workflow, asset) {
 			t.Errorf("release workflow does not publish %q", asset)
 		}
+	}
+	releaseAssetList := "files: |\n            release-assets/rescrobble-windows-amd64.exe\n            release-assets/rescrobble-linux-amd64\n            release-assets/SHA256SUMS"
+	releaseAssetStart := strings.Index(workflow, "files: |")
+	if releaseAssetStart == -1 || strings.TrimSpace(workflow[releaseAssetStart:]) != releaseAssetList {
+		t.Error("release asset upload list does not contain exactly the Windows and Linux binaries and checksum once")
 	}
 	if strings.Contains(workflow, "files: release-assets/*") {
 		t.Error("release workflow publishes an uncontrolled asset glob")
@@ -133,25 +133,48 @@ func TestReleaseDocumentationDefinesGitHubOnlyMVPDistribution(t *testing.T) {
 			"Scoop",
 			"Docker",
 			"rescrobble-windows-amd64.exe",
-			"rescrobble-darwin-amd64",
-			"rescrobble-darwin-arm64",
 			"rescrobble-linux-amd64",
-			"Apple Silicon macOS",
 			`.\rescrobble-windows-amd64.exe --help`,
-			"./rescrobble-darwin-amd64 --help",
-			"./rescrobble-darwin-arm64 --help",
 			"./rescrobble-linux-amd64 --help",
 			"SHA256SUMS",
 			"sha256sum --ignore-missing -c SHA256SUMS",
 			"gh attestation verify ./rescrobble-windows-amd64.exe --repo wesback/scrobble-backfill",
-			"gh attestation verify ./rescrobble-darwin-amd64 --repo wesback/scrobble-backfill",
-			"gh attestation verify ./rescrobble-darwin-arm64 --repo wesback/scrobble-backfill",
 			"gh attestation verify ./rescrobble-linux-amd64 --repo wesback/scrobble-backfill",
 		} {
 			if !strings.Contains(documentation, required) {
 				t.Errorf("%s does not contain %q", path, required)
 			}
 		}
+		for _, unsupported := range []string{
+			"rescrobble-darwin",
+			"Intel macOS",
+			"Apple Silicon macOS",
+		} {
+			if strings.Contains(documentation, unsupported) {
+				t.Errorf("%s contains unsupported release reference %q", path, unsupported)
+			}
+		}
+	}
+}
+
+func TestReadmeSupportedPlatformsAreWindowsAndLinux(t *testing.T) {
+	readme := readRepositoryFile(t, "README.md")
+	sentenceStart := strings.Index(readme, "The supported distribution channel")
+	if sentenceStart == -1 {
+		t.Fatal("README does not state its supported distribution channel")
+	}
+	sentenceEnd := strings.Index(readme[sentenceStart:], ".")
+	if sentenceEnd == -1 {
+		t.Fatal("README supported-platforms sentence is not terminated")
+	}
+	supportedPlatformsSentence := readme[sentenceStart : sentenceStart+sentenceEnd]
+	for _, platform := range []string{"Windows", "Linux"} {
+		if !strings.Contains(supportedPlatformsSentence, platform) {
+			t.Errorf("README supported-platforms sentence does not name %s", platform)
+		}
+	}
+	if strings.Contains(strings.ToLower(supportedPlatformsSentence), "macos") {
+		t.Error("README supported-platforms sentence names macOS")
 	}
 }
 
