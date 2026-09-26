@@ -27,16 +27,6 @@ jobs:
             goos: windows
             goarch: amd64
             binary: rescrobble-windows-amd64.exe
-          - name: macOS amd64
-            runner: macos-15-intel
-            goos: darwin
-            goarch: amd64
-            binary: rescrobble-darwin-amd64
-          - name: macOS ARM64
-            runner: macos-14
-            goos: darwin
-            goarch: arm64
-            binary: rescrobble-darwin-arm64
           - name: Linux amd64
             runner: ubuntu-24.04
             goos: linux
@@ -111,8 +101,6 @@ jobs:
         run: |
           binaries=(
             rescrobble-windows-amd64.exe
-            rescrobble-darwin-amd64
-            rescrobble-darwin-arm64
             rescrobble-linux-amd64
           )
           for binary in "${binaries[@]}"; do
@@ -126,8 +114,8 @@ jobs:
             exit 1
           fi
           sha256sum "${binaries[@]}" > SHA256SUMS
-          if [[ "$(wc -l < SHA256SUMS)" -ne 4 ]]; then
-            echo "error: SHA256SUMS does not contain exactly four entries" >&2
+          if [[ "$(wc -l < SHA256SUMS)" -ne 2 ]]; then
+            echo "error: SHA256SUMS does not contain exactly two entries" >&2
             exit 1
           fi
 
@@ -139,7 +127,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/rescrobble-windows-amd64.exe
-            release-assets/rescrobble-darwin-amd64
-            release-assets/rescrobble-darwin-arm64
             release-assets/rescrobble-linux-amd64
             release-assets/SHA256SUMS
