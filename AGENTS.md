@@ -16,6 +16,10 @@ acceptance reviewer verify once the issue is labeled `type:story`. Ask what's ne
 pin that down rather than guessing.
 
 **Acceptance criteria rules for stories and bug reports:**
+These rules govern every acceptance-criteria draft for this repo
+however it's produced — by hand, or via an installed skill like
+`/to-spec` or `/to-tickets`. Neither knows this pipeline's rules on its
+own; apply them on top of whatever template the skill uses.
 Criteria are evaluated by an automated runner and an independent
 acceptance reviewer against the test output and diff of a single worktree.
 To avoid stalling implementation or failing review convergence:
@@ -71,3 +75,12 @@ for the pipeline.
 Don't clear a `needs-review` label yourself unless you're the human
 actually approving that stage — it's the pipeline's only gate.
 <!-- ci-fix-loop-pipeline:end -->
+
+<!-- ci-fix-loop-agent-context-index:begin -->
+## Repository-specific context
+
+Before planning or implementing, read `docs/agent-context.md` for durable,
+verified facts about this repository. Add a fact only when work confirms it
+is reusable beyond the current task; keep task history, hypotheses, and
+temporary state in their existing issue or pipeline-memory records.
+<!-- ci-fix-loop-agent-context-index:end -->
