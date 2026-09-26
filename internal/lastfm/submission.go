@@ -17,7 +17,8 @@ import (
 const (
 	// MaxSubmissionBatchSize is Last.fm's maximum number of tracks in one
 	// track.scrobble request.
-	MaxSubmissionBatchSize = 50
+	MaxSubmissionBatchSize       = 50
+	consecutiveIgnoredBatchLimit = 3
 
 	// DefaultSubmissionDelay is deliberately conservative. Callers can
 	// replace it with a shorter value in tests or a configured value later.
@@ -139,6 +140,7 @@ func (s *SubmissionService) Submit(
 
 	completed := len(resume.Submitted)
 	previousRequest := completed > 0
+	ignoredCode, consecutiveIgnoredBatches := "", 0
 	for index := 0; index < len(batches); index++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -148,6 +150,11 @@ func (s *SubmissionService) Submit(
 		if index < len(resume.Run.Batches) {
 			batch = resume.Run.Batches[index]
 			if batch.State == journal.StateSubmitted {
+				code, allIgnored := journalBatchIgnoredCode(resume.Run, batch)
+				ignoredCode, consecutiveIgnoredBatches = nextIgnoredBatchStreak(ignoredCode, consecutiveIgnoredBatches, code, allIgnored)
+				if consecutiveIgnoredBatches >= consecutiveIgnoredBatchLimit {
+					return ignoredBatchesError(ignoredCode)
+				}
 				continue
 			}
 			if batch.State != journal.StatePlanned {
@@ -162,6 +169,11 @@ func (s *SubmissionService) Submit(
 					if err := s.options.Progress(completed, len(batches)); err != nil {
 						return fmt.Errorf("report Last.fm submission progress after batch %d: %w", batch.Sequence, err)
 					}
+				}
+				code, allIgnored := journalBatchIgnoredCode(resume.Run, batch)
+				ignoredCode, consecutiveIgnoredBatches = nextIgnoredBatchStreak(ignoredCode, consecutiveIgnoredBatches, code, allIgnored)
+				if consecutiveIgnoredBatches >= consecutiveIgnoredBatchLimit {
+					return ignoredBatchesError(ignoredCode)
 				}
 				previousRequest = true
 				continue
@@ -193,6 +205,11 @@ func (s *SubmissionService) Submit(
 			if err := s.options.Progress(completed, len(batches)); err != nil {
 				return fmt.Errorf("report Last.fm submission progress after batch %d: %w", batch.Sequence, err)
 			}
+		}
+		code, allIgnored := ignoredBatchCode(result, len(batch.Payloads))
+		ignoredCode, consecutiveIgnoredBatches = nextIgnoredBatchStreak(ignoredCode, consecutiveIgnoredBatches, code, allIgnored)
+		if consecutiveIgnoredBatches >= consecutiveIgnoredBatchLimit {
+			return ignoredBatchesError(ignoredCode)
 		}
 		previousRequest = true
 	}
@@ -436,18 +453,84 @@ func parseSubmissionResponse(response map[string]any, expected int) (submissionR
 func describeIgnoredCode(code string) string {
 	switch code {
 	case "1":
-		return "Artist was ignored (Last.fm code 1)"
+		return "Filtered artist (Last.fm code 1)"
 	case "2":
-		return "Track was ignored (Last.fm code 2)"
+		return "Filtered track (Last.fm code 2)"
 	case "3":
-		return "Timestamp is too old (Last.fm code 3)"
+		return "Timestamp too far in the past (Last.fm code 3)"
 	case "4":
-		return "Timestamp is too new (Last.fm code 4)"
+		return "Timestamp too far in the future (Last.fm code 4)"
 	case "5":
-		return "Daily scrobble limit exceeded (Last.fm code 5)"
+		return "Max daily scrobbles exceeded (Last.fm code 5)"
 	default:
 		return "Ignored by Last.fm without a reason (code " + code + ")"
 	}
+}
+
+func ignoredBatchCode(result submissionResult, payloadCount int) (string, bool) {
+	if payloadCount == 0 || result.accepted != 0 || len(result.ignored) != payloadCount {
+		return "", false
+	}
+	code := result.ignored[0].code
+	for _, ignored := range result.ignored[1:] {
+		if ignored.code != code {
+			return "", false
+		}
+	}
+	return code, true
+}
+
+func journalBatchIgnoredCode(run journal.Run, batch journal.Batch) (string, bool) {
+	batchNumber := strconv.Itoa(batch.Sequence)
+	var accepted, ignoredCount int
+	hasResult := false
+	var ignoredCodes []string
+	for _, event := range run.Events {
+		switch event.Type {
+		case "submission.batch.result":
+			if event.Data["batch"] != batchNumber {
+				continue
+			}
+			parsedAccepted, acceptedErr := strconv.Atoi(event.Data["accepted"])
+			parsedIgnored, ignoredErr := strconv.Atoi(event.Data["ignored"])
+			if acceptedErr != nil || ignoredErr != nil {
+				return "", false
+			}
+			accepted, ignoredCount, hasResult = parsedAccepted, parsedIgnored, true
+		case "submission.scrobble.ignored":
+			if event.Data["batch"] == batchNumber {
+				ignoredCodes = append(ignoredCodes, event.Data["code"])
+			}
+		}
+	}
+	if !hasResult || accepted != 0 || ignoredCount != len(batch.Payloads) ||
+		len(ignoredCodes) != len(batch.Payloads) || len(ignoredCodes) == 0 {
+		return "", false
+	}
+	code := ignoredCodes[0]
+	if code == "" {
+		return "", false
+	}
+	for _, ignoredCode := range ignoredCodes[1:] {
+		if ignoredCode != code {
+			return "", false
+		}
+	}
+	return code, true
+}
+
+func nextIgnoredBatchStreak(previousCode string, previousCount int, code string, allIgnored bool) (string, int) {
+	if !allIgnored {
+		return "", 0
+	}
+	if code == previousCode {
+		return code, previousCount + 1
+	}
+	return code, 1
+}
+
+func ignoredBatchesError(code string) error {
+	return fmt.Errorf("Last.fm ignored all plays in %d consecutive batches (code %s); stopping", consecutiveIgnoredBatchLimit, code)
 }
 
 func parseIgnoredCode(value any) (string, error) {

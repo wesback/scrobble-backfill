@@ -390,6 +390,19 @@ continuing the old one. The new live comparison skips plays already visible
 in Last.fm, while ignored plays can be reconsidered; use the old invocation
 ID with `verify` or `report` to inspect what the interrupted run recorded.
 
+## Last.fm may ignore old scrobbles
+
+Last.fm can ignore scrobbles with old timestamps. Its API documentation does
+not document an age cutoff; third-party reports of a roughly 14-day window
+are not a confirmed Last.fm limit. An ignored-message code or empty reason
+may not establish why a particular play was refused. Rescrobble sends the
+play's original timestamp and does not rewrite timestamps to bypass filtering.
+Backfills beyond Last.fm's accepted age limit therefore cannot be repaired
+here with their original timestamps.
+After three consecutive batches in which every play is ignored with the same
+code, the import stops and reports the refusal instead of submitting more
+batches.
+
 An import of 100 or fewer missing plays proceeds without an interactive
 confirmation. More than 100 requires an explicit `y`/`yes`, unless `--yes`
 is supplied. `--dry-run` performs parsing, date filtering, eligibility,

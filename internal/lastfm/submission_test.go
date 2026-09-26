@@ -453,11 +453,143 @@ func TestSubmissionDescribesIgnoredItemWithEmptyReason(t *testing.T) {
 		}
 	}
 	want := []string{
-		"3: Timestamp is too old (Last.fm code 3)",
+		"3: Timestamp too far in the past (Last.fm code 3)",
 		"42: Ignored by Last.fm without a reason (code 42)",
 	}
 	if !reflect.DeepEqual(reasons, want) {
 		t.Fatalf("ignored reasons = %q, want %q", reasons, want)
+	}
+}
+
+func TestDescribeIgnoredCodeUsesLastFMDocumentation(t *testing.T) {
+	tests := []struct {
+		code string
+		want string
+	}{
+		{"1", "Filtered artist (Last.fm code 1)"},
+		{"2", "Filtered track (Last.fm code 2)"},
+		{"3", "Timestamp too far in the past (Last.fm code 3)"},
+		{"4", "Timestamp too far in the future (Last.fm code 4)"},
+		{"5", "Max daily scrobbles exceeded (Last.fm code 5)"},
+		{"42", "Ignored by Last.fm without a reason (code 42)"},
+	}
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			if got := describeIgnoredCode(test.code); got != test.want {
+				t.Fatalf("describeIgnoredCode(%q) = %q, want %q", test.code, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSubmissionStopsAfterThreeWholeBatchesIgnoredWithSameCode(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-all-ignored")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := make([]journal.Submission, 201)
+	for index := range plays {
+		plays[index] = journal.Submission{
+			Artist:    "Artist",
+			Track:     fmt.Sprintf("Track %03d", index),
+			Timestamp: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Duration(index) * time.Minute),
+		}
+	}
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		writeAllIgnoredScrobbles(w, r, "1")
+	}))
+	defer server.Close()
+
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+	profile := AuthenticatedProfile{Username: "alice", SessionKey: testSubmissionSession}
+	err = service.Submit(context.Background(), profile, run, plays)
+	wantError := "Last.fm ignored all plays in 3 consecutive batches (code 1); stopping"
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("submission error = %v, want %q", err, wantError)
+	}
+	if requests != 3 {
+		t.Fatalf("submission requests = %d, want 3", requests)
+	}
+	resume, err := store.Resume(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("resume stopped run: %v", err)
+	}
+	if len(resume.Submitted) != 3 || len(resume.Run.Batches) != 3 {
+		t.Fatalf("journal has %d submitted of %d batches, want all three attempted batches submitted", len(resume.Submitted), len(resume.Run.Batches))
+	}
+
+	err = service.Submit(context.Background(), profile, resume.Run, plays)
+	if err == nil || err.Error() != wantError {
+		t.Fatalf("resumed submission error = %v, want %q", err, wantError)
+	}
+	if requests != 3 {
+		t.Fatalf("submission requests after resume = %d, want no further requests", requests)
+	}
+}
+
+func TestSubmissionDoesNotStopAcrossAcceptedIgnoredAndPartiallyIgnoredBatches(t *testing.T) {
+	store := journal.NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	run, err := store.CreateRun("personal", "import-partially-ignored")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	plays := make([]journal.Submission, 201)
+	for index := range plays {
+		plays[index] = journal.Submission{
+			Artist:    "Artist",
+			Track:     fmt.Sprintf("Track %03d", index),
+			Timestamp: time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC).Add(time.Duration(index) * time.Minute),
+		}
+	}
+
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		switch requests {
+		case 1, 5:
+			writeAllAcceptedScrobbles(w, r)
+		case 2, 4:
+			writeAllIgnoredScrobbles(w, r, "1")
+		case 3:
+			writeAlternatingAcceptedAndIgnoredScrobbles(w, r)
+		default:
+			t.Errorf("unexpected submission request %d", requests)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	service := NewSubmissionService(client, store, SubmissionOptions{BaselineDelay: 0})
+	if err := service.Submit(context.Background(), AuthenticatedProfile{
+		Username: "alice", SessionKey: testSubmissionSession,
+	}, run, plays); err != nil {
+		t.Fatalf("submit partial-acceptance batches: %v", err)
+	}
+	if requests != 5 {
+		t.Fatalf("submission requests = %d, want all 5 batches", requests)
+	}
+	resume, err := store.Resume(run.Profile, run.InvocationID)
+	if err != nil {
+		t.Fatalf("resume completed run: %v", err)
+	}
+	if len(resume.Submitted) != 5 {
+		t.Fatalf("submitted batches = %d, want 5", len(resume.Submitted))
+	}
+	var thirdBatchWasPartial bool
+	for _, event := range resume.Run.Events {
+		if event.Type == "submission.batch.result" && event.Data["batch"] == "3" {
+			thirdBatchWasPartial = event.Data["accepted"] == "25" && event.Data["ignored"] == "25"
+		}
+	}
+	if !thirdBatchWasPartial {
+		t.Fatal("batch 3 was not recorded with both accepted and ignored plays")
 	}
 }
 
@@ -511,6 +643,30 @@ func writeAllAcceptedScrobbles(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, `{"scrobbles":{"@attr":{"accepted":%d,"ignored":0},"scrobble":[%s]}}`,
 		len(items), strings.Join(items, ","))
+}
+
+func writeAllIgnoredScrobbles(w http.ResponseWriter, r *http.Request, code string) {
+	items := make([]string, 0)
+	for index := 0; r.FormValue(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+		items = append(items, fmt.Sprintf(`{"ignoredMessage":{"code":%q,"#text":""}}`, code))
+	}
+	fmt.Fprintf(w, `{"scrobbles":{"@attr":{"accepted":0,"ignored":%d},"scrobble":[%s]}}`,
+		len(items), strings.Join(items, ","))
+}
+
+func writeAlternatingAcceptedAndIgnoredScrobbles(w http.ResponseWriter, r *http.Request) {
+	items := make([]string, 0)
+	accepted := 0
+	for index := 0; r.FormValue(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+		if index%2 == 0 {
+			accepted++
+			items = append(items, `{"ignoredMessage":{"code":0,"#text":""}}`)
+		} else {
+			items = append(items, `{"ignoredMessage":{"code":1,"#text":""}}`)
+		}
+	}
+	fmt.Fprintf(w, `{"scrobbles":{"@attr":{"accepted":%d,"ignored":%d},"scrobble":[%s]}}`,
+		accepted, len(items)-accepted, strings.Join(items, ","))
 }
 
 func TestSubmissionLeavesExhaustedRetryBatchPlanned(t *testing.T) {
