@@ -1190,6 +1190,9 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		currentRun, openErr := store.OpenRun(profileName, invocationID)
 		if openErr == nil {
 			events = appendBatchOutcomeEvents(events, currentRun)
+			if summaryErr := printIgnoredSubmissionSummary(stdout, currentRun, options.logLevel >= observability.LevelVerbose); summaryErr != nil {
+				err = fmt.Errorf("%w; report ignored scrobbles: %v", err, summaryErr)
+			}
 			for _, batch := range currentRun.Batches {
 				if batch.State == journal.StatePlanned {
 					failureBatch = strconv.Itoa(batch.Sequence)
@@ -1212,6 +1215,9 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		return failImport(fmt.Errorf("read completed import journal: %w", openErr))
 	}
 	events = appendBatchOutcomeEvents(events, currentRun)
+	if err := printIgnoredSubmissionSummary(stdout, currentRun, options.logLevel >= observability.LevelVerbose); err != nil {
+		return failImport(fmt.Errorf("report ignored scrobbles: %w", err))
+	}
 	events = append(events, journal.Event{Type: "run.completed", Timestamp: time.Now().UTC()})
 	if err := recordEvents(); err != nil {
 		fmt.Fprintf(stderr, "error: record import outcome: %v\n", err)
@@ -1219,13 +1225,6 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	}
 	accepted, ignored := submissionOutcomeCounts(currentRun)
 	fmt.Fprintf(stdout, "Accepted %d scrobbles; ignored %d.\n", accepted, ignored)
-	for _, event := range currentRun.Events {
-		if event.Type != "submission.scrobble.ignored" {
-			continue
-		}
-		fmt.Fprintf(stdout, "  Ignored: %s - %s: %s\n",
-			event.Data["artist"], event.Data["track"], event.Data["reason"])
-	}
 	return 0
 }
 
@@ -1598,6 +1597,60 @@ func submissionOutcomeCounts(run journal.Run) (accepted, ignored int) {
 		}
 	}
 	return accepted, ignored
+}
+
+func printIgnoredSubmissionSummary(w io.Writer, run journal.Run, verbose bool) error {
+	type ignoredRange struct {
+		count    int
+		oldest   time.Time
+		newest   time.Time
+		hasRange bool
+	}
+	byCode := make(map[string]ignoredRange)
+	for _, event := range run.Events {
+		if event.Type != "submission.scrobble.ignored" {
+			continue
+		}
+		timestamp, err := time.Parse(time.RFC3339Nano, event.Data["timestamp"])
+		if err != nil {
+			return fmt.Errorf("parse ignored scrobble timestamp: %w", err)
+		}
+		timestamp = timestamp.UTC()
+		code := event.Data["code"]
+		rangeForCode := byCode[code]
+		rangeForCode.count++
+		if !rangeForCode.hasRange || timestamp.Before(rangeForCode.oldest) {
+			rangeForCode.oldest = timestamp
+		}
+		if !rangeForCode.hasRange || timestamp.After(rangeForCode.newest) {
+			rangeForCode.newest = timestamp
+		}
+		rangeForCode.hasRange = true
+		byCode[code] = rangeForCode
+	}
+	codes := make([]string, 0, len(byCode))
+	for code := range byCode {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	for _, code := range codes {
+		rangeForCode := byCode[code]
+		fmt.Fprintf(w, "Ignored by Last.fm: code %s: %d plays, %s to %s\n",
+			code,
+			rangeForCode.count,
+			rangeForCode.oldest.Format("2006-01-02"),
+			rangeForCode.newest.Format("2006-01-02"))
+	}
+	if verbose {
+		for _, event := range run.Events {
+			if event.Type != "submission.scrobble.ignored" {
+				continue
+			}
+			fmt.Fprintf(w, "  Ignored: %s - %s: %s\n",
+				event.Data["artist"], event.Data["track"], event.Data["reason"])
+		}
+	}
+	return nil
 }
 
 func parseAnalysisDate(value string, location *time.Location) (time.Time, error) {
