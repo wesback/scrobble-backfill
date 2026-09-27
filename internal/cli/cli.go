@@ -62,6 +62,7 @@ type Dependencies struct {
 	JournalStore    journal.Store
 	Submission      lastfm.SubmissionOptions
 	Input           io.Reader
+	Now             func() time.Time
 }
 
 const secureStoreGuidance = "make an OS-native credential service available (Windows Credential Manager, macOS Keychain, or Linux Secret Service); on Linux, the encrypted local fallback is selected only when Secret Service is unavailable and provides weaker protection"
@@ -112,6 +113,11 @@ func RunWithDependencies(args []string, stdout, stderr io.Writer, dependencies D
 	}
 	if command[0] != "import" && (options.dryRun || options.yes) {
 		fmt.Fprintln(stderr, "error: --dry-run and --yes are only valid with import")
+		printUsage(stderr)
+		return 2
+	}
+	if command[0] != "import" && options.remapWindowSet {
+		fmt.Fprintln(stderr, "error: --remap-window is only valid with import")
 		printUsage(stderr)
 		return 2
 	}
@@ -168,6 +174,8 @@ type options struct {
 	timestampToleranceSet bool
 	batchDelay            time.Duration
 	batchDelaySet         bool
+	remapWindow           time.Duration
+	remapWindowSet        bool
 	reportFormat          report.Format
 	reportFormatCount     int
 	dryRun                bool
@@ -234,7 +242,7 @@ func parseArgs(args []string) (options, []string, error) {
 		case arg == "--html":
 			options.reportFormat = report.FormatHTML
 			options.reportFormatCount++
-		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance", arg == "--batch-delay":
+		case arg == "--from", arg == "--to", arg == "--timestamp-tolerance", arg == "--batch-delay", arg == "--remap-window":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", arg)
 			}
@@ -242,7 +250,7 @@ func parseArgs(args []string) (options, []string, error) {
 				return options, nil, err
 			}
 			i++
-		case strings.HasPrefix(arg, "--from="), strings.HasPrefix(arg, "--to="), strings.HasPrefix(arg, "--timestamp-tolerance="), strings.HasPrefix(arg, "--batch-delay="):
+		case strings.HasPrefix(arg, "--from="), strings.HasPrefix(arg, "--to="), strings.HasPrefix(arg, "--timestamp-tolerance="), strings.HasPrefix(arg, "--batch-delay="), strings.HasPrefix(arg, "--remap-window="):
 			name, value, _ := strings.Cut(arg, "=")
 			if strings.TrimSpace(value) == "" {
 				return options, nil, fmt.Errorf("%s requires a value", name)
@@ -279,6 +287,16 @@ func setOperationalOption(options *options, name, value string) error {
 		}
 		options.batchDelay = delay
 		options.batchDelaySet = true
+	case "--remap-window":
+		window, err := time.ParseDuration(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("--remap-window must be a positive duration (for example 336h): %w", err)
+		}
+		if window <= 0 {
+			return errors.New("--remap-window must be a positive duration")
+		}
+		options.remapWindow = window
+		options.remapWindowSet = true
 	default:
 		return fmt.Errorf("unknown operational option %q", name)
 	}
@@ -903,7 +921,7 @@ func runAnalyse(command []string, options options, stdout, stderr io.Writer, dep
 func runImport(command []string, options options, stdout, stderr io.Writer, dependencies Dependencies) int {
 	if len(command) == 0 {
 		fmt.Fprintln(stderr, "error: import requires at least one Spotify export input")
-		fmt.Fprintln(stderr, "usage: rescrobble [options] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
+		fmt.Fprintln(stderr, "usage: rescrobble [options] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--remap-window duration] [--dry-run] [--yes] <export>...")
 		return 2
 	}
 	if dependencies.ConfigStore == nil {
@@ -983,6 +1001,54 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 			return 1
 		}
 	}
+	comparisonFrom, comparisonTo := from, to
+	var selectionStart, selectionEnd time.Time
+	var targetStart, targetEnd time.Time
+	var comparisonSelectionFrom, comparisonSelectionTo time.Time
+	var transformPlay func(spotify.Play) (spotify.Play, error)
+	if options.remapWindowSet {
+		selectionStart, selectionEnd = localDateBounds(from, to, location)
+		comparisonSelectionFrom, comparisonSelectionTo = from, to
+		anchorStore, ok := store.(journal.RemapAnchorStore)
+		if !ok {
+			fmt.Fprintln(stderr, "error: journal store does not support persisted remap anchors")
+			return 1
+		}
+		now := time.Now
+		if dependencies.Now != nil {
+			now = dependencies.Now
+		}
+		anchorKey := remapAnchorKey(selectionStart, selectionEnd, options.remapWindow)
+		targetStart, targetEnd, err = anchorStore.GetOrCreateRemapAnchor(profileName, anchorKey, now(), options.remapWindow)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: get import remap anchor: %v\n", err)
+			return 1
+		}
+		comparisonFrom, comparisonTo = targetStart.In(location), targetEnd.In(location)
+		var remappedCount int64
+		var previousRemapped time.Time
+		transformPlay = func(play spotify.Play) (spotify.Play, error) {
+			remappedCount++
+			if remappedCount > int64(options.remapWindow/lastfm.MinimumScrobbleSpacing) {
+				return spotify.Play{}, fmt.Errorf(
+					"minimum scrobble spacing cannot fit %d eligible plays in the %s target window",
+					remappedCount, options.remapWindow,
+				)
+			}
+			mapped := lastfm.RemapTimestamp(play.Timestamp, selectionStart, selectionEnd, targetStart, targetEnd)
+			candidates := []time.Time{mapped}
+			if !previousRemapped.IsZero() {
+				candidates = []time.Time{previousRemapped, mapped}
+			}
+			spaced, err := lastfm.EnforceMinimumSpacing(candidates, lastfm.MinimumScrobbleSpacing, targetEnd)
+			if err != nil {
+				return spotify.Play{}, err
+			}
+			play.Timestamp = spaced[len(spaced)-1]
+			previousRemapped = play.Timestamp
+			return play, nil
+		}
+	}
 	invocationID := fmt.Sprintf("import-%d", time.Now().UTC().UnixNano())
 	run, err := store.CreateRun(profileName, invocationID)
 	if err != nil {
@@ -991,7 +1057,7 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	}
 	submissionDelay := resolveSubmissionDelay(cfg, options, dependencies.Submission)
 	settings := journal.RunSettings{
-		From: from, To: to,
+		From: comparisonFrom, To: comparisonTo,
 		TimestampTolerance: timestampTolerance, TimestampToleranceSet: true,
 		EligibilityRule: "eligible when the play satisfies Last.fm's scrobble eligibility rule",
 		BatchDelay:      submissionDelay, BatchDelaySet: true,
@@ -1063,12 +1129,15 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 		dependencies.LastFMClient,
 		lastfm.AuthenticatedProfile{Username: profile.LastFMUsername, SessionKey: sessionKey},
 		lastfm.ComparisonRequest{
-			From:                         from,
-			To:                           to,
+			From:                         comparisonFrom,
+			To:                           comparisonTo,
+			SelectionFrom:                comparisonSelectionFrom,
+			SelectionTo:                  comparisonSelectionTo,
 			Timezone:                     location,
 			TimestampTolerance:           timestampTolerance,
 			TimestampToleranceSet:        timestampToleranceSet,
 			DurationLookupFailureHandler: durationLookupWarningHandler(stderr),
+			TransformPlay:                transformPlay,
 			Plays: func(ctx context.Context, consume spotify.Consumer) error {
 				deliveredRecords := 0
 				progressingConsume := func(play spotify.Play) error {
@@ -1121,7 +1190,7 @@ func runImport(command []string, options options, stdout, stderr io.Writer, depe
 	fmt.Fprintf(stdout, "Total Spotify plays: %d\n", ingestionSummary.Records)
 	fmt.Fprintf(stdout, "Skipped duplicates: %d\n", summary.Matched)
 	fmt.Fprintf(stdout, "Missing plays: %d\n", summary.Missing)
-	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", from.In(location).Format("2006-01-02"), to.In(location).Format("2006-01-02"))
+	fmt.Fprintf(stdout, "Covered date range: %s to %s\n", comparisonFrom.In(location).Format("2006-01-02"), comparisonTo.In(location).Format("2006-01-02"))
 	fmt.Fprintf(stdout, "Timestamp tolerance: %s\n", summary.TimestampTolerance)
 	if options.dryRun {
 		fmt.Fprintln(stdout, "Dry run: no Last.fm submissions will be sent.")
@@ -1665,6 +1734,23 @@ func parseAnalysisDate(value string, location *time.Location) (time.Time, error)
 	return date, nil
 }
 
+func localDateBounds(from, to time.Time, location *time.Location) (time.Time, time.Time) {
+	fromLocal, toLocal := from.In(location), to.In(location)
+	start := time.Date(fromLocal.Year(), fromLocal.Month(), fromLocal.Day(), 0, 0, 0, 0, location)
+	end := time.Date(toLocal.Year(), toLocal.Month(), toLocal.Day(), 0, 0, 0, 0, location).
+		AddDate(0, 0, 1).Add(-time.Nanosecond)
+	return start, end
+}
+
+func remapAnchorKey(selectionStart, selectionEnd time.Time, windowLength time.Duration) string {
+	return fmt.Sprintf(
+		"selection:%s:%s:window:%d",
+		selectionStart.UTC().Format(time.RFC3339Nano),
+		selectionEnd.UTC().Format(time.RFC3339Nano),
+		windowLength,
+	)
+}
+
 func resolveTimestampTolerance(cfg config.Config, options options) (time.Duration, bool) {
 	if options.timestampToleranceSet {
 		return options.timestampTolerance, true
@@ -1729,7 +1815,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] status")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] doctor")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...")
-	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...")
+	fmt.Fprintln(w, "  rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--remap-window duration] [--dry-run] [--yes] <export>...")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] verify [<invocation-id>...]")
 	fmt.Fprintln(w, "  rescrobble [--profile <name>] report (--json|--csv|--html) [<invocation-id>]")
 	fmt.Fprintln(w, "  Native credential storage is preferred. Linux uses an encrypted local fallback only when Secret Service is unavailable.")

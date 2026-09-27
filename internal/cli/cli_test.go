@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1237,6 +1238,9 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 			if got := r.PostForm.Get("track[0]"); got != "Missing" {
 				t.Errorf("submitted track = %q, want Missing", got)
 			}
+			if got := r.PostForm.Get("timestamp[0]"); got != fmt.Sprint(base.Unix()) {
+				t.Errorf("submitted timestamp = %q, want selected Spotify timestamp %d when remapping is disabled", got, base.Unix())
+			}
 			writeAllAcceptedScrobbles(w, r)
 		default:
 			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
@@ -1286,6 +1290,269 @@ func TestImportRunsLiveComparisonSkipsDuplicatesAndResolvesProfileAndBounds(t *t
 	}
 	if submissionCalls != 1 {
 		t.Fatalf("submission calls = %d, want only the first missing play submitted", submissionCalls)
+	}
+}
+
+func TestImportRemappingReportsPersistedTargetWindowAndIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	selectionStart := time.Date(2020, 1, 2, 0, 0, 0, 0, time.Local)
+	writeSpotifyAnalysisExport(t, exportPath,
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"First","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:first"}`, selectionStart.Add(2*time.Hour).Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Second","master_metadata_album_artist_name":"Artist","master_metadata_album_album_name":"Album","spotify_track_uri":"spotify:track:second"}`, selectionStart.Add(10*time.Hour).Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Third","master_metadata_album_album_name":"Album","master_metadata_album_artist_name":"Artist","spotify_track_uri":"spotify:track:third"}`, selectionStart.Add(20*time.Hour).Format(time.RFC3339)),
+	)
+
+	const remapLength = 14 * 24 * time.Hour
+	currentTime := time.Date(2026, 9, 27, 12, 0, 0, 0, time.Local)
+	targetStart, targetEnd := currentTime.Add(-remapLength), currentTime
+	localStart := targetStart.In(time.Local)
+	localEnd := targetEnd.In(time.Local)
+	wantFrom := time.Date(localStart.Year(), localStart.Month(), localStart.Day(), 0, 0, 0, 0, time.Local).UTC().Unix()
+	wantTo := time.Date(localEnd.Year(), localEnd.Month(), localEnd.Day(), 0, 0, 0, 0, time.Local).
+		AddDate(0, 0, 1).Add(-time.Nanosecond).UTC().Unix()
+
+	type acceptedScrobble struct {
+		artist    string
+		track     string
+		timestamp int64
+	}
+	var accepted []acceptedScrobble
+	var historyRequests, submissionRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			historyRequests++
+			if got := r.PostForm.Get("from"); got != fmt.Sprint(wantFrom) {
+				t.Errorf("history from = %q, want target-window start %d", got, wantFrom)
+			}
+			if got := r.PostForm.Get("to"); got != fmt.Sprint(wantTo) {
+				t.Errorf("history to = %q, want target-window end %d", got, wantTo)
+			}
+			fmt.Fprint(w, `{"recenttracks":{"track":[`)
+			for index, scrobble := range accepted {
+				if index > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, `{"artist":{"#text":%q},"name":%q,"date":{"uts":%q}}`,
+					scrobble.artist, scrobble.track, fmt.Sprint(scrobble.timestamp))
+			}
+			fmt.Fprint(w, `],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			submissionRequests++
+			for index := 0; r.PostForm.Get(fmt.Sprintf("track[%d]", index)) != ""; index++ {
+				timestamp, err := strconv.ParseInt(r.PostForm.Get(fmt.Sprintf("timestamp[%d]", index)), 10, 64)
+				if err != nil {
+					t.Errorf("parse submitted timestamp: %v", err)
+					return
+				}
+				if timestamp < targetStart.Unix() || timestamp > targetEnd.Unix() {
+					t.Errorf("submitted timestamp %d is outside target window [%d, %d]", timestamp, targetStart.Unix(), targetEnd.Unix())
+				}
+				accepted = append(accepted, acceptedScrobble{
+					artist:    r.PostForm.Get(fmt.Sprintf("artist[%d]", index)),
+					track:     r.PostForm.Get(fmt.Sprintf("track[%d]", index)),
+					timestamp: timestamp,
+				})
+			}
+			writeAllAcceptedScrobbles(w, r)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	dependencies := Dependencies{
+		ConfigStore:     configStore,
+		CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+		LastFMClient:    client,
+		JournalStore:    journal.NewFileStore(filepath.Join(root, "journal")),
+		Submission:      lastfm.SubmissionOptions{BaselineDelay: 0},
+		Now:             func() time.Time { return currentTime },
+	}
+	args := []string{
+		"import", "--from", "2020-01-02", "--to", "2020-01-02",
+		"--remap-window", "336h", "--batch-delay", "0s", "--yes", exportPath,
+	}
+
+	var stdout, stderr bytes.Buffer
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("first import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	wantRange := fmt.Sprintf(
+		"Covered date range: %s to %s",
+		targetStart.In(time.Local).Format("2006-01-02"),
+		targetEnd.In(time.Local).Format("2006-01-02"),
+	)
+	if !strings.Contains(stdout.String(), wantRange) ||
+		!strings.Contains(stdout.String(), "Missing plays: 3") ||
+		!strings.Contains(stdout.String(), "Accepted 3 scrobbles; ignored 0.") {
+		t.Fatalf("first import output = %q, want target range and 3 accepted scrobbles", stdout.String())
+	}
+	if len(accepted) != 3 {
+		t.Fatalf("accepted scrobbles = %d, want 3", len(accepted))
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if exitCode := RunWithDependencies(args, &stdout, &stderr, dependencies); exitCode != 0 {
+		t.Fatalf("second import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Skipped duplicates: 3") ||
+		!strings.Contains(stdout.String(), "Missing plays: 0") ||
+		!strings.Contains(stdout.String(), "Nothing to submit.") {
+		t.Fatalf("second import output = %q, want zero missing plays and three skipped duplicates", stdout.String())
+	}
+	if historyRequests != 2 {
+		t.Fatalf("history requests = %d, want one target-window comparison per import", historyRequests)
+	}
+	if submissionRequests != 1 {
+		t.Fatalf("submission requests = %d, want only the first import submission", submissionRequests)
+	}
+}
+
+func TestImportReportsCoveredComparedDateRangeFromPersistedTargetWindow(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	oldPlay := time.Date(2020, 1, 2, 12, 0, 0, 0, time.Local)
+	writeSpotifyAnalysisExport(t, exportPath,
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Old track","master_metadata_album_artist_name":"Artist","spotify_track_uri":"spotify:track:old"}`, oldPlay.Format(time.RFC3339)),
+	)
+
+	const targetWindowLength = 14 * 24 * time.Hour
+	currentTime := time.Date(2026, 9, 27, 12, 0, 0, 0, time.Local)
+	targetFrom, targetTo := currentTime.Add(-targetWindowLength), currentTime
+	var historyRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse Last.fm request: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			historyRequests++
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{
+			"import", "--from", "2020-01-02", "--to", "2020-01-02",
+			"--remap-window", "336h", "--dry-run", exportPath,
+		},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+			LastFMClient:    client,
+			JournalStore:    journal.NewFileStore(filepath.Join(root, "journal")),
+			Now:             func() time.Time { return currentTime },
+		},
+	)
+	if exitCode != 0 {
+		t.Fatalf("import exit code = %d, stderr = %q", exitCode, stderr.String())
+	}
+	wantCoveredRange := fmt.Sprintf(
+		"Covered date range: %s to %s",
+		targetFrom.In(time.Local).Format("2006-01-02"),
+		targetTo.In(time.Local).Format("2006-01-02"),
+	)
+	if !strings.Contains(stdout.String(), wantCoveredRange) {
+		t.Fatalf("summary = %q, want covered/compared target date range %q", stdout.String(), wantCoveredRange)
+	}
+	if strings.Contains(stdout.String(), "Covered date range: 2020-01-02") {
+		t.Fatalf("summary = %q, want persisted target dates rather than selection date", stdout.String())
+	}
+	if historyRequests != 1 {
+		t.Fatalf("history requests = %d, want one comparison against the persisted target window", historyRequests)
+	}
+}
+
+func TestImportRemappingSpacingOverflowStopsBeforeSubmission(t *testing.T) {
+	root := t.TempDir()
+	exportPath := filepath.Join(root, "history.json")
+	timestamp := time.Date(2020, 1, 2, 12, 0, 0, 0, time.Local)
+	writeSpotifyAnalysisExport(t, exportPath,
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"First","master_metadata_album_artist_name":"Artist","spotify_track_uri":"spotify:track:first"}`, timestamp.Add(-12*time.Hour).Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Second","master_metadata_album_artist_name":"Artist","spotify_track_uri":"spotify:track:second"}`, timestamp.Format(time.RFC3339)),
+		fmt.Sprintf(`{"ts":%q,"platform":"web","ms_played":240000,"master_metadata_track_name":"Third","master_metadata_album_artist_name":"Artist","spotify_track_uri":"spotify:track:third"}`, timestamp.Add(11*time.Hour+59*time.Minute+59*time.Second).Format(time.RFC3339)),
+	)
+
+	var submissionRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		switch r.PostForm.Get("method") {
+		case "user.getRecentTracks":
+			fmt.Fprint(w, `{"recenttracks":{"track":[],"@attr":{"totalPages":"1"}}}`)
+		case "track.scrobble":
+			submissionRequests++
+			writeAllAcceptedScrobbles(w, r)
+		default:
+			t.Errorf("unexpected Last.fm method %q", r.PostForm.Get("method"))
+		}
+	}))
+	defer server.Close()
+
+	configStore := config.NewFileStore(filepath.Join(root, "config.json"))
+	if err := configStore.Save(config.Config{
+		Profiles:      map[string]config.Profile{"personal": {Name: "personal", LastFMUsername: "alice"}},
+		ActiveProfile: "personal",
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	client := lastfm.NewClient("app-key", "app-secret")
+	client.BaseURL = server.URL
+	var stdout, stderr bytes.Buffer
+	exitCode := RunWithDependencies(
+		[]string{"import", "--from", "2020-01-02", "--to", "2020-01-02", "--remap-window", "1m", "--yes", exportPath},
+		&stdout,
+		&stderr,
+		Dependencies{
+			ConfigStore:     configStore,
+			CredentialStore: &commandCredentialStore{sessions: map[string]string{"personal": "session"}},
+			LastFMClient:    client,
+			JournalStore:    journal.NewFileStore(filepath.Join(root, "journal")),
+			Now:             func() time.Time { return time.Date(2026, 9, 27, 12, 0, 0, 0, time.Local) },
+		},
+	)
+	if exitCode == 0 {
+		t.Fatalf("exit code = 0, want remapping spacing overflow; stdout = %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot fit 3 eligible plays in the 1m0s target window") {
+		t.Fatalf("stderr = %q, want minimum-spacing capacity error", stderr.String())
+	}
+	if submissionRequests != 0 {
+		t.Fatalf("submission requests = %d, want zero after spacing overflow", submissionRequests)
 	}
 }
 

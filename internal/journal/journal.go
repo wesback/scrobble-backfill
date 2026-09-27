@@ -75,6 +75,13 @@ type RunSettings struct {
 	BatchDelaySet         bool          `json:"batch_delay_set,omitempty"`
 }
 
+// RemapAnchor persists the target interval selected for one date-remapped
+// import key.
+type RemapAnchor struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
 // Event is a portable, non-secret outcome in a run. Data values must contain
 // diagnostics and counts only; credentials are never part of this boundary.
 type Event struct {
@@ -120,6 +127,11 @@ type Store interface {
 // so existing journal.Store implementations remain source-compatible.
 type MetadataStore interface {
 	SetRunSettings(profile, invocationID string, settings RunSettings) error
+}
+
+// RemapAnchorStore persists stable target windows for date-remapped imports.
+type RemapAnchorStore interface {
+	GetOrCreateRemapAnchor(profile, key string, currentTime time.Time, windowLength time.Duration) (time.Time, time.Time, error)
 }
 
 // EventRecorder is the structured event boundary used by imports and reports.
@@ -276,6 +288,54 @@ func (s *FileStore) SetRunSettings(profile, invocationID string, settings RunSet
 		return err
 	}
 	return nil
+}
+
+// GetOrCreateRemapAnchor returns the target window already stored for key, or
+// persists a window ending at currentTime and beginning windowLength earlier.
+func (s *FileStore) GetOrCreateRemapAnchor(profile, key string, currentTime time.Time, windowLength time.Duration) (time.Time, time.Time, error) {
+	if err := validateProfile(profile); err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if strings.TrimSpace(key) == "" || key != strings.TrimSpace(key) {
+		return time.Time{}, time.Time{}, errors.New("remap anchor key must not be empty or padded with whitespace")
+	}
+	if currentTime.IsZero() {
+		return time.Time{}, time.Time{}, errors.New("remap anchor current time must not be zero")
+	}
+	if windowLength <= 0 {
+		return time.Time{}, time.Time{}, errors.New("remap anchor window length must be positive")
+	}
+	if err := s.validatePath(); err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := s.acquireProfileLock(profile)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	defer func() { _ = lock.Close() }()
+
+	doc, err := s.load(profile)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	if anchor, ok := doc.RemapAnchors[key]; ok {
+		if anchor.Start.IsZero() || anchor.End.IsZero() || !anchor.End.After(anchor.Start) {
+			return time.Time{}, time.Time{}, fmt.Errorf("journal remap anchor %q for profile %q is invalid", key, profile)
+		}
+		return anchor.Start, anchor.End, nil
+	}
+	end := currentTime.UTC()
+	start := end.Add(-windowLength)
+	if doc.RemapAnchors == nil {
+		doc.RemapAnchors = make(map[string]RemapAnchor)
+	}
+	doc.RemapAnchors[key] = RemapAnchor{Start: start, End: end}
+	if err := s.save(profile, doc); err != nil && !isCommittedSaveError(err) {
+		return time.Time{}, time.Time{}, err
+	}
+	return start, end, nil
 }
 
 // RecordEvent appends one structured outcome to a run.
@@ -509,8 +569,9 @@ func (s *FileStore) CheckReadable(profile string) error {
 }
 
 type document struct {
-	Profile string `json:"profile"`
-	Runs    []Run  `json:"runs"`
+	Profile      string                 `json:"profile"`
+	Runs         []Run                  `json:"runs"`
+	RemapAnchors map[string]RemapAnchor `json:"remap_anchors,omitempty"`
 }
 
 func (s *FileStore) validatePath() error {

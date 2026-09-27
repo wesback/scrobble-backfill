@@ -316,3 +316,44 @@ func TestJournalSerializesSeparateStoreInstances(t *testing.T) {
 		}
 	}
 }
+
+func TestFileStoreReusesIndependentRemapAnchors(t *testing.T) {
+	store := NewFileStore(filepath.Join(t.TempDir(), "journal"))
+	now := time.Date(2026, 9, 27, 15, 30, 0, 0, time.FixedZone("test", 2*60*60))
+	windowLength := 14 * 24 * time.Hour
+
+	firstStart, firstEnd, err := store.GetOrCreateRemapAnchor("personal", "selection-a", now, windowLength)
+	if err != nil {
+		t.Fatalf("create first remap anchor: %v", err)
+	}
+	if !firstEnd.Equal(now) {
+		t.Fatalf("first anchor end = %s, want supplied current time %s", firstEnd, now)
+	}
+	if got := firstEnd.Sub(firstStart); got != windowLength {
+		t.Fatalf("first anchor length = %s, want %s", got, windowLength)
+	}
+
+	later := now.Add(48 * time.Hour)
+	reusedStart, reusedEnd, err := store.GetOrCreateRemapAnchor("personal", "selection-a", later, windowLength)
+	if err != nil {
+		t.Fatalf("reuse first remap anchor: %v", err)
+	}
+	if !reusedStart.Equal(firstStart) || !reusedEnd.Equal(firstEnd) {
+		t.Fatalf("reused anchor = [%s, %s], want original [%s, %s]", reusedStart, reusedEnd, firstStart, firstEnd)
+	}
+
+	otherStart, otherEnd, err := store.GetOrCreateRemapAnchor("personal", "selection-b", later, windowLength)
+	if err != nil {
+		t.Fatalf("create independent remap anchor: %v", err)
+	}
+	if !otherEnd.Equal(later) || otherStart.Equal(firstStart) || otherEnd.Equal(firstEnd) {
+		t.Fatalf("independent anchor = [%s, %s], want a new window ending %s", otherStart, otherEnd, later)
+	}
+	reusedStart, reusedEnd, err = store.GetOrCreateRemapAnchor("personal", "selection-a", now.Add(96*time.Hour), windowLength)
+	if err != nil {
+		t.Fatalf("recheck first remap anchor: %v", err)
+	}
+	if !reusedStart.Equal(firstStart) || !reusedEnd.Equal(firstEnd) {
+		t.Fatalf("first anchor changed after another key was stored: [%s, %s]", reusedStart, reusedEnd)
+	}
+}
