@@ -208,7 +208,7 @@ rescrobble [--profile <name>] logout
 rescrobble [--profile <name>] status
 rescrobble [--profile <name>] doctor
 rescrobble [--profile <name>] analyse [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] <export>...
-rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--dry-run] [--yes] <export>...
+rescrobble [--profile <name>] import [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--timestamp-tolerance duration] [--batch-delay duration] [--remap-window duration] [--dry-run] [--yes] <export>...
 rescrobble [--profile <name>] verify [<invocation-id>...]
 rescrobble [--profile <name>] report (--json|--csv|--html) [<invocation-id>]
 rescrobble [--profile <name>] profile use <name>
@@ -391,10 +391,33 @@ ID with `verify` or `report` to inspect what the interrupted run recorded.
 Last.fm can ignore scrobbles with old timestamps. Its API documentation does
 not document an age cutoff; third-party reports of a roughly 14-day window
 are not a confirmed Last.fm limit. An ignored-message code or empty reason
-may not establish why a particular play was refused. Rescrobble sends the
-play's original timestamp and does not rewrite timestamps to bypass filtering.
+may not establish why a particular play was refused. By default, Rescrobble
+sends the play's original timestamp and does not rewrite timestamps.
 Backfills beyond Last.fm's accepted age limit therefore cannot be repaired
-here with their original timestamps.
+with their original timestamps.
+
+For old backfills, `--remap-window <duration>` linearly maps selected Spotify
+timestamps into a recent target window. For example, `--remap-window 336h`
+uses a 14-day target window:
+
+```sh
+rescrobble import --from 2020-01-01 --to 2020-12-31 \
+  --remap-window 336h --yes my_spotify_export.zip
+```
+
+The `--from` and `--to` bounds continue to select original Spotify plays.
+The target window is persisted in the profile journal for the selection
+dates and window length, so retrying the same backfill reuses identical
+timestamps and compares against the remapped dates. The import summary shows
+the target date range. Remapped timestamps are spaced at least 30 seconds
+apart; if the selected eligible plays do not fit, the import fails before
+submitting any scrobbles.
+
+The anchor does not detect changes to export files between runs. Keep the
+selected export data unchanged when retrying a remapped import; replacing or
+editing it under the same selection dates may cause different plays to share
+the persisted target window.
+
 After three consecutive batches in which every play is ignored with the same
 code, the import stops and reports the refusal instead of submitting more
 batches.

@@ -56,6 +56,12 @@ type ComparisonRequest struct {
 	To                 time.Time
 	Timezone           *time.Location
 	TimestampTolerance time.Duration
+	// SelectionFrom and SelectionTo optionally bound original source plays
+	// separately from the Last.fm history window in From and To.
+	SelectionFrom time.Time
+	SelectionTo   time.Time
+	// TransformPlay runs after eligibility and before matching and submission.
+	TransformPlay func(spotify.Play) (spotify.Play, error)
 	// TimestampToleranceSet distinguishes an explicitly supplied zero
 	// tolerance from an omitted tolerance, which uses the default.
 	TimestampToleranceSet bool
@@ -123,6 +129,16 @@ func Compare(
 	start, end, err := comparisonBounds(request.From, request.To, location)
 	if err != nil {
 		return ComparisonSummary{}, err
+	}
+	selectionStart, selectionEnd := start, end
+	if !request.SelectionFrom.IsZero() || !request.SelectionTo.IsZero() {
+		if request.SelectionFrom.IsZero() || request.SelectionTo.IsZero() {
+			return ComparisonSummary{}, errors.New("Last.fm comparison: selection from and to dates must both be set")
+		}
+		selectionStart, selectionEnd, err = comparisonBounds(request.SelectionFrom, request.SelectionTo, location)
+		if err != nil {
+			return ComparisonSummary{}, fmt.Errorf("Last.fm comparison: selection window: %w", err)
+		}
 	}
 	tolerance := request.TimestampTolerance
 	if tolerance == 0 && !request.TimestampToleranceSet {
@@ -214,8 +230,8 @@ func Compare(
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		timestamp := play.Timestamp.UTC()
-		if timestamp.Before(start) || timestamp.After(end) {
+		sourceTimestamp := play.Timestamp.UTC()
+		if sourceTimestamp.Before(selectionStart) || sourceTimestamp.After(selectionEnd) {
 			return nil
 		}
 		decision, err := evaluator.Evaluate(ctx, play)
@@ -225,6 +241,16 @@ func Compare(
 		if !decision.Eligible {
 			summary.ExcludedByReason[string(decision.Reason)]++
 			return nil
+		}
+		if request.TransformPlay != nil {
+			play, err = request.TransformPlay(play)
+			if err != nil {
+				return err
+			}
+		}
+		timestamp := play.Timestamp.UTC()
+		if timestamp.Before(start) || timestamp.After(end) {
+			return fmt.Errorf("Last.fm comparison: transformed play timestamp %s is outside comparison window", timestamp)
 		}
 		summary.Eligible++
 		if err := flushStaleGroups(timestamp); err != nil {
