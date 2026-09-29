@@ -34,6 +34,10 @@ To avoid stalling implementation or failing review convergence:
 - **Specify concrete automated verification.** Frame criteria around checkable
   assertions (unit tests, integration tests, or browser tests measuring rendered
   properties) rather than subjective visual inspection.
+- **Name the exact check for a named browser test.** When a criterion names a
+  specific browser, E2E, or integration test file and requires its behavior or
+  selectors to keep working, include the exact existing command that runs that
+  file. A general test-suite command does not prove that the named file ran.
 - **Never require verification this repo's deterministic test command doesn't
   perform.** "The production build passes," "no lint errors," "typecheck is
   clean" — the story runner hands the acceptance reviewer only that command's
